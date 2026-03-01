@@ -1,0 +1,55 @@
+[package]
+name = "nanocode-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Workspace dependencies
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+dirs.workspace = true
+
+# Async trait
+async-trait = "0.1"
+
+# Regex for tool parsing
+regex = "1"
+
+# Llama.cpp bindings usando libs do sistema (llama/ggml já compiladas com CUDA)
+llama-cpp-2 = { version = "0.1", features = ["system-ggml"] }
+
+# Async channels
+flume = "0.11"
+
+# Parallel processing
+rayon = "1"
+
+# CPU detection
+num_cpus = "1"
+encoding_rs = "0.8"
+
+# Embedded OpenAI-compatible local server
+axum = "0.7"
+reqwest.workspace = true
+
+# Features for tools
+[features]
+default = ["tool-bash", "tool-read", "tool-write", "tool-grep"]
+tool-bash = []
+tool-read = []
+tool-write = []
+tool-grep = []
+
+[dev-dependencies]
+tokio.workspace = true

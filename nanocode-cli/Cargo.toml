@@ -1,0 +1,43 @@
+[package]
+name = "nanocode-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "nanocode"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace dependencies
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+clap.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+
+# Internal crates
+nanocode-core = { path = "../nanocode-core" }
+nanocode-hf = { path = "../nanocode-hf" }
+
+# TUI
+ratatui = "0.28"
+crossterm = "0.28"
+
+# Input handling
+tokio-util = "0.7"
+
+# CLI progress UI
+indicatif = "0.17"
+syntect = "5"
+
+[dev-dependencies]
+tokio.workspace = true

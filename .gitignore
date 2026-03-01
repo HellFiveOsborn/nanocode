@@ -1,0 +1,12 @@
+# Rust
+/target/
+
+# Arquivos locais de planejamento/contexto (não versionar)
+PLANO.md
+MEMORY.md
+OVERVIEW.md
+progress.md
+
+# Pastas locais auxiliares
+.claude/
+test_folder/
