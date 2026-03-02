@@ -1439,7 +1439,7 @@ dependencies = [
 
 [[package]]
 name = "nanocode-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1464,7 +1464,7 @@ dependencies = [
 
 [[package]]
 name = "nanocode-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1491,7 +1491,7 @@ dependencies = [
 
 [[package]]
 name = "nanocode-hf"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "dirs",

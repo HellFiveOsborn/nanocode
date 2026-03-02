@@ -1,23 +1,28 @@
 use std::collections::HashMap;
 
+use nanocode_core::agents::BuiltinAgent;
 use nanocode_core::NcConfig;
 
 use super::state::{AppState, ChatItem, InputMode, SlashCommandEntry};
 
 pub const MAX_SLASH_SUGGESTIONS: usize = 8;
 
-const SLASH_COMMANDS: [SlashCommandEntry; 12] = [
+const SLASH_COMMANDS: [SlashCommandEntry; 14] = [
     SlashCommandEntry {
         alias: "/help",
         description: "Show help message",
     },
     SlashCommandEntry {
         alias: "/config",
-        description: "Show config shortcut info",
+        description: "Open configuration settings",
     },
     SlashCommandEntry {
         alias: "/model",
-        description: "Show active model info",
+        description: "Open model/quantization setup",
+    },
+    SlashCommandEntry {
+        alias: "/setup",
+        description: "Alias for /model",
     },
     SlashCommandEntry {
         alias: "/reload",
@@ -42,6 +47,10 @@ const SLASH_COMMANDS: [SlashCommandEntry; 12] = [
     SlashCommandEntry {
         alias: "/status",
         description: "Display agent statistics",
+    },
+    SlashCommandEntry {
+        alias: "/agent",
+        description: "Show or switch active agent profile",
     },
     SlashCommandEntry {
         alias: "/proxy-setup",
@@ -147,10 +156,12 @@ fn slash_help_text() -> String {
 
 fn slash_status_text(app: &AppState) -> String {
     format!(
-        "Status: {}\nModel: {}\nSession messages: {}\nTokens used: {}",
+        "Status: {}\nAgent: {}\nModel: {}\nSession messages: {}\nContext tokens: {}\nTotal tokens: {}",
         app.status,
+        app.active_agent.as_str(),
         app.model_label,
         app.chat.len(),
+        app.stats.context_tokens,
         app.stats.tokens_used
     )
 }
@@ -178,12 +189,53 @@ pub fn handle_local_command(
         "/status" => {
             app.chat.push(ChatItem::Assistant(slash_status_text(app)));
         }
-        "/model" | "/config" => {
-            app.chat.push(ChatItem::Assistant(format!(
-                "Active model: {}\nConfig file: {}",
-                app.model_label,
-                NcConfig::config_path().display()
-            )));
+        "/agent" => {
+            let mut parts = prompt.split_whitespace();
+            let _ = parts.next();
+            if let Some(target_name) = parts.next() {
+                if let Some(target_agent) = BuiltinAgent::parse(target_name) {
+                    if target_agent == app.active_agent {
+                        app.chat.push(ChatItem::Assistant(format!(
+                            "Agent `{}` is already active.",
+                            target_agent.as_str()
+                        )));
+                    } else {
+                        app.requested_agent_switch = Some(target_agent);
+                        app.chat.push(ChatItem::Assistant(format!(
+                            "Switching agent to `{}` for this session...",
+                            target_agent.as_str()
+                        )));
+                    }
+                } else {
+                    app.chat.push(ChatItem::Error(format!(
+                        "Unknown agent `{}`. Available: {}",
+                        target_name,
+                        BuiltinAgent::available_names().join(", ")
+                    )));
+                }
+            } else {
+                app.chat.push(ChatItem::Assistant(format!(
+                    "Active agent: `{}`. Available: {}",
+                    app.active_agent.as_str(),
+                    BuiltinAgent::available_names().join(", ")
+                )));
+            }
+        }
+        "/model" | "/models" => {
+            app.open_model_setup_requested = true;
+            app.chat
+                .push(ChatItem::Assistant("Opening model setup...".to_string()));
+        }
+        "/setup" => {
+            app.open_model_setup_requested = true;
+            app.chat
+                .push(ChatItem::Assistant("Opening model setup...".to_string()));
+        }
+        "/config" => {
+            app.open_settings_requested = true;
+            app.chat.push(ChatItem::Assistant(
+                "Opening configuration settings...".to_string(),
+            ));
         }
         "/reload" => {
             app.chat.push(ChatItem::Assistant(

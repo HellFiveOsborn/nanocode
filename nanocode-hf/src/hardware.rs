@@ -1,5 +1,6 @@
 //! Hardware detection
 
+use crate::catalog::ModelSpec;
 use crate::quantization::QuantizationVariant;
 use serde::{Deserialize, Serialize};
 use sysinfo::System;
@@ -153,7 +154,14 @@ impl HardwareInfo {
         };
 
         let (gpu_usage_pct, gpu_temp_c, vram_used_mb, vram_total_mb) = gpu_metrics
-            .map(|m| (m.gpu_usage_pct, m.gpu_temp_c, m.vram_used_mb, Some(m.vram_total_mb)))
+            .map(|m| {
+                (
+                    m.gpu_usage_pct,
+                    m.gpu_temp_c,
+                    m.vram_used_mb,
+                    Some(m.vram_total_mb),
+                )
+            })
             .unwrap_or((None, None, None, self.vram_mb));
 
         RuntimeTelemetry {
@@ -255,9 +263,7 @@ fn detect_nvidia_gpu_metrics() -> Option<NvidiaGpuMetrics> {
 }
 
 /// Recommend a quantization based on hardware
-pub fn recommend(hw: &HardwareInfo) -> Option<&'static QuantizationVariant> {
-    use crate::registry::THE_MODEL;
-
+pub fn recommend(hw: &HardwareInfo, model: &ModelSpec) -> Option<&'static QuantizationVariant> {
     // Use VRAM if available, otherwise use RAM
     let memory_mb = hw.vram_mb.unwrap_or(hw.ram_mb);
 
@@ -275,12 +281,13 @@ pub fn recommend(hw: &HardwareInfo) -> Option<&'static QuantizationVariant> {
         // 4-6GB - Lower quality
         "Q2_K"
     } else {
-        // <4GB - Very low
-        "IQ2_S"
+        // <4GB - Lowest currently supported in catalog
+        "Q2_K"
     };
 
-    THE_MODEL
+    model
         .quantizations
         .iter()
         .find(|q| q.name == recommended)
+        .or_else(|| model.quantizations.first())
 }

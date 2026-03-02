@@ -1,20 +1,10 @@
 //! Model registry
 
-use crate::quantization::{QuantizationVariant, QWEN3_4B_QUANTIZATIONS};
-use std::path::Path;
-
-/// Model specification
-pub struct ModelSpec {
-    pub display_name: &'static str,
-    pub hf_repo: &'static str,
-    /// Maximum context supported by the model architecture
-    pub max_context_size: u32,
-    /// Recommended context for general usage
-    pub recommended_context_general: u32,
-    /// Recommended context for coding / harder reasoning tasks
-    pub recommended_context_coding: u32,
-    pub quantizations: &'static [QuantizationVariant],
-}
+use crate::catalog::{models, ModelSpec};
+use crate::quantization::is_compatible_quant_size;
+use crate::quantization::QuantizationVariant;
+use anyhow::{anyhow, Result};
+use std::path::{Path, PathBuf};
 
 /// Runtime limits computed from model specs + hardware
 #[derive(Debug, Clone, Copy)]
@@ -22,16 +12,6 @@ pub struct RuntimeLimits {
     pub context_size: u32,
     pub max_tokens: u32,
 }
-
-/// The model: Qwen3 4B Thinking
-pub const THE_MODEL: ModelSpec = ModelSpec {
-    display_name: "Qwen3 4B Thinking",
-    hf_repo: "unsloth/Qwen3-4B-Thinking-2507-GGUF",
-    max_context_size: 262_144,
-    recommended_context_general: 32_768,
-    recommended_context_coding: 81_920,
-    quantizations: QWEN3_4B_QUANTIZATIONS,
-};
 
 /// Compute runtime context/token limits from model and hardware memory budget.
 ///
@@ -85,15 +65,18 @@ pub fn recommend_runtime_limits(
 }
 
 /// Find installed quantization in models directory
-pub fn find_installed_quant(models_dir: &Path) -> Option<&'static QuantizationVariant> {
+pub fn find_installed_quant(
+    models_dir: &Path,
+    model: &ModelSpec,
+) -> Option<&'static QuantizationVariant> {
     if !models_dir.exists() {
         return None;
     }
 
     // Check each quantization variant
-    for quant in THE_MODEL.quantizations {
+    for quant in model.quantizations {
         let path = models_dir.join(quant.filename);
-        if path.exists() {
+        if is_cached_quant_valid(&path, quant.size_bytes) {
             return Some(quant);
         }
     }
@@ -101,15 +84,98 @@ pub fn find_installed_quant(models_dir: &Path) -> Option<&'static QuantizationVa
     None
 }
 
+/// List all cached quantizations for a model.
+pub fn list_cached_quants(
+    models_dir: &Path,
+    model: &ModelSpec,
+) -> Vec<&'static QuantizationVariant> {
+    if !models_dir.exists() {
+        return Vec::new();
+    }
+
+    model
+        .quantizations
+        .iter()
+        .filter(|quant| {
+            let path = models_dir.join(quant.filename);
+            is_cached_quant_valid(&path, quant.size_bytes)
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+pub struct CacheCleanupReport {
+    pub removed_paths: Vec<PathBuf>,
+}
+
+/// Enforce a single cached quantization for the given model.
+///
+/// Keeps `keep_quant_name` and removes all other `.gguf` and `.part` artifacts
+/// for that model.
+pub fn enforce_single_quant_cache(
+    models_dir: &Path,
+    model: &ModelSpec,
+    keep_quant_name: &str,
+) -> Result<CacheCleanupReport> {
+    let keep_quant = find_quant_by_name(model, keep_quant_name)
+        .ok_or_else(|| anyhow!("Unknown quantization: {}", keep_quant_name))?;
+    let keep_path = models_dir.join(keep_quant.filename);
+    if !is_cached_quant_valid(&keep_path, keep_quant.size_bytes) {
+        return Err(anyhow!(
+            "Selected quantization is not cached with a valid size on disk: {}",
+            keep_quant_name
+        ));
+    }
+
+    let mut removed_paths = Vec::new();
+    for quant in model.quantizations {
+        if quant.name == keep_quant_name {
+            continue;
+        }
+        let gguf_path = models_dir.join(quant.filename);
+        if gguf_path.exists() {
+            std::fs::remove_file(&gguf_path)?;
+            removed_paths.push(gguf_path);
+        }
+        let part_path = models_dir.join(format!("{}.part", quant.filename));
+        if part_path.exists() {
+            std::fs::remove_file(&part_path)?;
+            removed_paths.push(part_path);
+        }
+    }
+
+    Ok(CacheCleanupReport { removed_paths })
+}
+
 /// Find a quantization by name
-pub fn find_quant_by_name(name: &str) -> Option<&'static QuantizationVariant> {
-    THE_MODEL.quantizations.iter().find(|q| q.name == name)
+pub fn find_quant_by_name(model: &ModelSpec, name: &str) -> Option<&'static QuantizationVariant> {
+    model.quantizations.iter().find(|q| q.name == name)
 }
 
 /// Get download URL for a quantization
-pub fn get_download_url(quant: &QuantizationVariant) -> String {
+pub fn get_download_url(model: &ModelSpec, quant: &QuantizationVariant) -> String {
     format!(
         "https://huggingface.co/{}/resolve/main/{}",
-        THE_MODEL.hf_repo, quant.filename
+        model.hf_repo, quant.filename
     )
+}
+
+/// Find any installed model + quantization pair from the catalog.
+pub fn find_any_installed_model_quant(
+    models_dir: &Path,
+) -> Option<(&'static ModelSpec, &'static QuantizationVariant)> {
+    for model in models() {
+        if let Some(quant) = find_installed_quant(models_dir, model) {
+            return Some((model, quant));
+        }
+    }
+    None
+}
+
+fn is_cached_quant_valid(path: &Path, expected_size: u64) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let actual_size = meta.len();
+    is_compatible_quant_size(actual_size, expected_size)
 }

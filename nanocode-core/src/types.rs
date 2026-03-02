@@ -98,6 +98,7 @@ pub struct AvailableTool {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentStats {
     pub turns: u32,
+    pub context_tokens: u32,
     pub tokens_used: u32,
     pub tokens_in: u32,
     pub tokens_out: u32,
@@ -170,6 +171,14 @@ pub enum ToolPermission {
     Ask,
 }
 
+/// User decision for tool approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    ApproveOnce,
+    ApproveAlwaysToolSession,
+    Deny,
+}
+
 /// Invoke context for tool execution
 pub struct InvokeContext {
     pub tool_call_id: String,
@@ -179,7 +188,8 @@ pub struct InvokeContext {
 /// Approval request for a tool
 #[derive(Debug, Clone)]
 pub struct ApprovalRequest {
+    pub tool_call_id: String,
     pub tool_name: String,
-    pub arguments: String,
+    pub arguments: serde_json::Value,
     pub permission: ToolPermission,
 }

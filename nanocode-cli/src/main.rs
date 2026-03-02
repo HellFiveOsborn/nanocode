@@ -4,15 +4,18 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use nanocode_core::agent_loop::{AgentLoop, LoopEvent};
-use nanocode_core::llm::{PromptFamily, PromptVariant};
+use nanocode_core::agents::AgentPolicy;
+use nanocode_core::llm::PromptFamily;
 use nanocode_core::prompts::load_prompt;
 use nanocode_core::tools::ToolManager;
-use nanocode_core::NcConfig;
+use nanocode_core::{ApprovalDecision, NcConfig};
 use nanocode_hf::{
-    find_installed_quant, find_quant_by_name, recommend_runtime_limits, HardwareInfo, THE_MODEL,
+    default_model, find_any_installed_model_quant, find_installed_quant, find_model,
+    find_quant_by_name, recommend_runtime_limits, HardwareInfo,
 };
 use serde_json::Value;
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -21,11 +24,11 @@ use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 use syntect::util::as_24_bit_terminal_escaped;
 
-mod setup;
 mod tui;
 
 #[derive(Parser)]
 #[command(name = "nanocode")]
+#[command(version)]
 #[command(about = "AI coding assistant with local LLM", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -103,22 +106,46 @@ async fn main() -> Result<()> {
     if cli.auto_approve {
         config.auto_approve = true;
     }
-
-    let is_setup_command = matches!(&cli.command, Some(Commands::Setup));
-    if !NcConfig::is_model_installed() && !is_setup_command {
-        println!("No model found. Running first-time setup...");
-        setup::run_first_time_setup(&mut config).await?;
-    }
+    let selected_agent =
+        AgentPolicy::resolve(&cli.agent).map_err(|err| anyhow::anyhow!(err.to_string()))?;
 
     match &cli.command {
-        Some(Commands::Setup) => setup::run_first_time_setup(&mut config).await?,
+        Some(Commands::Setup) => {
+            tui::run_tui(
+                &mut config,
+                cli.ctk.clone(),
+                cli.ctv.clone(),
+                true,
+                selected_agent.builtin,
+            )
+            .await?
+        }
         Some(Commands::Sessions) => list_sessions().await?,
         Some(Commands::Config) => println!("{}", toml::to_string_pretty(&config)?),
         None => {
             if let Some(prompt) = cli.prompt {
-                run_prompt(&prompt, &config, cli.ctk.clone(), cli.ctv.clone()).await?;
+                if !NcConfig::is_model_installed() {
+                    return Err(anyhow::anyhow!(
+                        "No model installed. Run 'nanocode' to complete onboarding or 'nanocode setup'."
+                    ));
+                }
+                run_prompt(
+                    &prompt,
+                    &config,
+                    cli.ctk.clone(),
+                    cli.ctv.clone(),
+                    selected_agent.clone(),
+                )
+                .await?;
             } else {
-                tui::run_tui(&config, cli.ctk.clone(), cli.ctv.clone()).await?;
+                tui::run_tui(
+                    &mut config,
+                    cli.ctk.clone(),
+                    cli.ctv.clone(),
+                    false,
+                    selected_agent.builtin,
+                )
+                .await?;
             }
         }
     }
@@ -360,42 +387,10 @@ fn style_shimmer_text(text: &str, frame: usize) -> String {
 }
 
 const THINKING_PROMPT_BOOSTER: &str = r#"
-## Thinking Mode: CONFIDENT ACTION
-
-**Your Mindset:**
-- Simple tasks deserve simple solutions
-- 80% confidence is ENOUGH to act
-- Perfect is the enemy of done
-- Users prefer fast answers over perfect analysis
-
-**Decision Rule:**
-If you find yourself thinking for more than 30 seconds:
-→ STOP
-→ Pick the most obvious tool
-→ CALL IT NOW
-
-**Ambiguity Handling:**
-- Missing filename? → List directory (`ls -l`)
-- Unclear path? → Use current directory
-- Multiple interpretations? → Pick simplest, act
-- User can clarify AFTER seeing results
-
-**Token Awareness:**
-- Every "Wait..." costs 10 tokens
-- Every "Hmm..." costs 5 tokens
-- Budget: 150 tokens for simple tasks
-- At 100 tokens? → Force tool call
-
-**Action Mantras:**
-- "Good enough → Execute"
-- "List first, filter later"
-- "Show results, then ask"
-- "Action creates clarity"
-
-**Language:**
-- Match user language in final response
-- Tool calls in English
-- No translation loops
+## Thinking Discipline
+- Keep reasoning private and brief.
+- Avoid meta narration ("hmm", "wait", "I should").
+- If a tool is needed, call it quickly.
 "#;
 
 fn is_thinking_model(display_name: &str, quant_name: &str) -> bool {
@@ -505,35 +500,53 @@ async fn run_prompt(
     config: &NcConfig,
     ctk_override: Option<String>,
     ctv_override: Option<String>,
+    agent_policy: AgentPolicy,
 ) -> Result<()> {
+    let configured_model = config
+        .active_model
+        .as_deref()
+        .and_then(find_model)
+        .unwrap_or_else(default_model);
     let model_path = NcConfig::models_dir();
-    let quant = if let Some(active_name) = config.active_quant.as_deref() {
-        if let Some(active_quant) = find_quant_by_name(active_name) {
+    let (model, quant) = if let Some(active_name) = config.active_quant.as_deref() {
+        if let Some(active_quant) = find_quant_by_name(configured_model, active_name) {
             let active_path = model_path.join(active_quant.filename);
             if active_path.exists() {
-                active_quant
+                (configured_model, active_quant)
             } else {
-                find_installed_quant(&model_path).expect("No model installed")
+                find_installed_quant(&model_path, configured_model)
+                    .map(|q| (configured_model, q))
+                    .or_else(|| find_any_installed_model_quant(&model_path))
+                    .ok_or_else(|| anyhow::anyhow!("No model installed"))?
             }
         } else {
-            find_installed_quant(&model_path).expect("No model installed")
+            find_installed_quant(&model_path, configured_model)
+                .map(|q| (configured_model, q))
+                .or_else(|| find_any_installed_model_quant(&model_path))
+                .ok_or_else(|| anyhow::anyhow!("No model installed"))?
         }
     } else {
-        find_installed_quant(&model_path).expect("No model installed")
+        find_installed_quant(&model_path, configured_model)
+            .map(|q| (configured_model, q))
+            .or_else(|| find_any_installed_model_quant(&model_path))
+            .ok_or_else(|| anyhow::anyhow!("No model installed"))?
     };
 
     let model_file = model_path.join(quant.filename);
     let hw = HardwareInfo::detect();
     let memory_mb = hw.vram_mb.unwrap_or(hw.ram_mb);
-    let runtime_limits = recommend_runtime_limits(memory_mb, &THE_MODEL, true);
+    let runtime_limits = recommend_runtime_limits(memory_mb, model, true);
 
     let mut runtime_config = config.clone();
+    if agent_policy.auto_approve {
+        runtime_config.auto_approve = true;
+    }
     runtime_config.model.context_size = Some(
         runtime_config
             .model
             .context_size
             .unwrap_or(runtime_limits.context_size)
-            .min(THE_MODEL.max_context_size)
+            .min(model.max_context_size)
             .max(8_192),
     );
     if let Some(ctk) = ctk_override {
@@ -543,8 +556,8 @@ async fn run_prompt(
         runtime_config.model.kv_cache_type_v = Some(ctv);
     }
 
-    let mut system_prompt = load_prompt(PromptFamily::Qwen3, PromptVariant::AgentDefault);
-    if is_thinking_model(THE_MODEL.display_name, quant.name) {
+    let mut system_prompt = load_prompt(PromptFamily::Qwen3, agent_policy.prompt_variant);
+    if is_thinking_model(model.display_name, quant.name) {
         system_prompt = format!("{}\n\n{}", system_prompt, THINKING_PROMPT_BOOSTER);
     }
     if quant.name == "Q2_K" {
@@ -558,7 +571,36 @@ async fn run_prompt(
         .clamp(512, 8192);
 
     let tool_manager = ToolManager::new(&runtime_config);
+    tool_manager.set_enabled_tools(agent_policy.enabled_tools.clone());
+    for (tool_name, permission) in &agent_policy.tool_permission_overrides {
+        let _ = tool_manager.set_permission(tool_name, *permission);
+    }
     let mut loop_engine = AgentLoop::new(runtime_config.clone(), tool_manager);
+    loop_engine.set_agent_name(agent_policy.builtin.as_str());
+    loop_engine.set_approval_handler(|request| {
+        println!();
+        println!("Permission required for tool: {}", request.tool_name);
+        println!("call_id: {}", request.tool_call_id);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&request.arguments)
+                .unwrap_or_else(|_| request.arguments.to_string())
+        );
+        print!("Allow action? [y=once / a=always this tool (session) / n=deny]: ");
+        let _ = io::stdout().flush();
+
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_ok() {
+            let normalized = input.trim().to_ascii_lowercase();
+            if normalized == "y" || normalized == "yes" {
+                return ApprovalDecision::ApproveOnce;
+            }
+            if normalized == "a" || normalized == "always" {
+                return ApprovalDecision::ApproveAlwaysToolSession;
+            }
+        }
+        ApprovalDecision::Deny
+    });
     loop_engine.add_system_message(system_prompt);
     loop_engine.add_user_message(prompt_text);
 
@@ -764,6 +806,29 @@ async fn run_prompt(
                     thinking_banner_shown = false;
                 }
             }
+            LoopEvent::CompactStart {
+                old_context_tokens,
+                threshold,
+            } => {
+                println!();
+                println!(
+                    "[compact] Triggered at {} tokens (threshold {}).",
+                    old_context_tokens, threshold
+                );
+            }
+            LoopEvent::CompactEnd {
+                old_context_tokens,
+                new_context_tokens,
+                summary_len,
+            } => {
+                println!(
+                    "[compact] Completed: {} -> {} tokens (summary {} chars).",
+                    old_context_tokens, new_context_tokens, summary_len
+                );
+            }
+            LoopEvent::StoppedByMiddleware { reason } => {
+                eprintln!("[middleware] {}", reason);
+            }
             LoopEvent::Chunk(chunk) => {
                 if first_token_at.is_none() {
                     let elapsed = total_start.elapsed().as_secs_f32();
@@ -854,7 +919,8 @@ async fn run_prompt(
     let tps = stats.tokens_out as f32 / infer_elapsed;
 
     println!();
-    println!("• Model: {} ({})", THE_MODEL.display_name, quant.name);
+    println!("• Model: {} ({})", model.display_name, quant.name);
+    println!("• Context Tokens: {}", stats.context_tokens);
     println!("• Input Tokens: {}", stats.tokens_in);
     println!("• Output Tokens: {}", stats.tokens_out);
     println!("• Total Tokens: {}", stats.tokens_used);

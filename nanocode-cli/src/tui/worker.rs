@@ -1,13 +1,13 @@
 use nanocode_core::agent_loop::{AgentLoop, LoopEvent};
-use nanocode_core::llm::{PromptFamily, PromptVariant};
+use nanocode_core::agents::AgentPolicy;
+use nanocode_core::llm::PromptFamily;
 use nanocode_core::prompts::load_prompt;
 use nanocode_core::tools::ToolManager;
-use nanocode_core::AgentStats;
-use nanocode_hf::THE_MODEL;
+use nanocode_core::{AgentStats, ApprovalDecision};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, SyncSender};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -16,19 +16,10 @@ use super::runtime::{is_thinking_model, RuntimeEnv};
 use super::stream::{extract_thinking_blocks_and_clean, StreamSanitizer};
 
 const THINKING_PROMPT_BOOSTER: &str = r#"
-## Thinking Mode: CONFIDENT ACTION
-
-**Your Mindset:**
-- Simple tasks deserve simple solutions
-- 80% confidence is ENOUGH to act
-- Perfect is the enemy of done
-- Users prefer fast answers over perfect analysis
-
-**Decision Rule:**
-If you find yourself thinking for more than 30 seconds:
-→ STOP
-→ Pick the most obvious tool
-→ CALL IT NOW
+## Thinking Discipline
+- Keep reasoning private and brief.
+- Avoid meta narration ("hmm", "wait", "I should").
+- If a tool is needed, call it quickly.
 "#;
 
 pub enum WorkerCommand {
@@ -49,11 +40,29 @@ pub enum WorkerEvent {
         call_id: String,
         summary: String,
     },
+    ApprovalRequired {
+        call_id: String,
+        summary: String,
+        arguments: String,
+        decision_tx: SyncSender<ApprovalDecision>,
+    },
     ToolResult {
         call_id: String,
         success: bool,
         status_line: Option<String>,
         result: String,
+    },
+    CompactStart {
+        old_context_tokens: u32,
+        threshold: u32,
+    },
+    CompactEnd {
+        old_context_tokens: u32,
+        new_context_tokens: u32,
+        summary_len: usize,
+    },
+    StoppedByMiddleware {
+        reason: String,
     },
     Stats(AgentStats),
     Error(String),
@@ -172,17 +181,56 @@ fn tool_status_line(
 
 pub fn spawn_worker(
     runtime: RuntimeEnv,
+    agent_policy: AgentPolicy,
     mut cmd_rx: mpsc::Receiver<WorkerCommand>,
     interrupt_signal: Arc<AtomicBool>,
 ) -> Receiver<WorkerEvent> {
     let (evt_tx, evt_rx) = channel::<WorkerEvent>();
 
     tokio::spawn(async move {
-        let tool_manager = ToolManager::new(&runtime.config);
-        let mut loop_engine = AgentLoop::new(runtime.config.clone(), tool_manager);
+        let mut effective_config = runtime.config.clone();
+        if agent_policy.auto_approve {
+            effective_config.auto_approve = true;
+        }
+        let tool_manager = ToolManager::new(&effective_config);
+        tool_manager.set_enabled_tools(agent_policy.enabled_tools.clone());
+        for (tool_name, permission) in &agent_policy.tool_permission_overrides {
+            let _ = tool_manager.set_permission(tool_name, *permission);
+        }
+        let mut loop_engine = AgentLoop::new(effective_config.clone(), tool_manager);
+        loop_engine.set_agent_name(agent_policy.builtin.as_str());
+        loop_engine.set_approval_handler({
+            let evt_tx = evt_tx.clone();
+            move |request| {
+                let target =
+                    short_preview(&tool_target(&request.tool_name, &request.arguments), 90);
+                let display_name = pretty_tool_name(&request.tool_name);
+                let summary = if target.is_empty() {
+                    format!("{}()", display_name)
+                } else {
+                    format!("{}({})", display_name, target)
+                };
+                let arguments = serde_json::to_string_pretty(&request.arguments)
+                    .unwrap_or_else(|_| request.arguments.to_string());
+                let (decision_tx, decision_rx) = std::sync::mpsc::sync_channel(1);
+                if evt_tx
+                    .send(WorkerEvent::ApprovalRequired {
+                        call_id: request.tool_call_id,
+                        summary,
+                        arguments,
+                        decision_tx,
+                    })
+                    .is_err()
+                {
+                    return ApprovalDecision::Deny;
+                }
 
-        let mut system_prompt = load_prompt(PromptFamily::Qwen3, PromptVariant::AgentDefault);
-        if is_thinking_model(THE_MODEL.display_name, &runtime.model_label) {
+                decision_rx.recv().unwrap_or(ApprovalDecision::Deny)
+            }
+        });
+
+        let mut system_prompt = load_prompt(PromptFamily::Qwen3, agent_policy.prompt_variant);
+        if is_thinking_model(runtime.model.display_name, runtime.quant.name) {
             system_prompt = format!("{}\n\n{}", system_prompt, THINKING_PROMPT_BOOSTER);
         }
         loop_engine.add_system_message(system_prompt);
@@ -301,6 +349,30 @@ pub fn spawn_worker(
                                 }
                                 LoopEvent::Stats(stats) => {
                                     let _ = evt_tx.send(WorkerEvent::Stats(stats));
+                                }
+                                LoopEvent::CompactStart {
+                                    old_context_tokens,
+                                    threshold,
+                                } => {
+                                    let _ = evt_tx.send(WorkerEvent::CompactStart {
+                                        old_context_tokens,
+                                        threshold,
+                                    });
+                                }
+                                LoopEvent::CompactEnd {
+                                    old_context_tokens,
+                                    new_context_tokens,
+                                    summary_len,
+                                } => {
+                                    let _ = evt_tx.send(WorkerEvent::CompactEnd {
+                                        old_context_tokens,
+                                        new_context_tokens,
+                                        summary_len,
+                                    });
+                                }
+                                LoopEvent::StoppedByMiddleware { reason } => {
+                                    let _ =
+                                        evt_tx.send(WorkerEvent::StoppedByMiddleware { reason });
                                 }
                                 LoopEvent::Message(_) | LoopEvent::Error(_) => {}
                             },

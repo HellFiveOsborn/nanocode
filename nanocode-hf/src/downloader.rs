@@ -1,10 +1,12 @@
 //! Model downloader
 
-use crate::quantization::QuantizationVariant;
+use crate::catalog::ModelSpec;
+use crate::quantization::{is_compatible_quant_size, QuantizationVariant};
 use crate::registry::get_download_url;
 use anyhow::Result;
 use futures_util::StreamExt;
 use reqwest::Client;
+use reqwest::StatusCode;
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
@@ -37,6 +39,7 @@ impl Downloader {
     /// Download a quantization
     pub async fn download(
         &self,
+        model: &ModelSpec,
         quant: &QuantizationVariant,
         dest_dir: &Path,
         progress_tx: mpsc::Sender<DownloadProgress>,
@@ -44,24 +47,25 @@ impl Downloader {
         // Create destination directory
         std::fs::create_dir_all(dest_dir)?;
 
-        let url = get_download_url(quant);
+        let url = get_download_url(model, quant);
         let dest_path = dest_dir.join(quant.filename);
         let part_path = dest_dir.join(format!("{}.part", quant.filename));
 
         // Check if already downloaded
         if dest_path.exists() {
-            tracing::info!("Model already downloaded: {:?}", dest_path);
-            return Ok(dest_path);
+            let existing_size = std::fs::metadata(&dest_path)?.len();
+            if is_compatible_quant_size(existing_size, quant.size_bytes) {
+                return Ok(dest_path);
+            }
+            std::fs::remove_file(&dest_path)?;
         }
 
         // Resume from partial download
-        let start_offset = if part_path.exists() {
+        let mut start_offset = if part_path.exists() {
             std::fs::metadata(&part_path)?.len()
         } else {
             0
         };
-
-        tracing::info!("Starting download from offset {}", start_offset);
 
         // Build request
         let mut request = self.client.get(&url);
@@ -76,16 +80,38 @@ impl Downloader {
 
         // Download with streaming
         let response = request.send().await?;
+        let status = response.status();
 
-        let total_size = response
-            .content_length()
-            .map(|c| c + start_offset)
-            .unwrap_or(quant.size_bytes);
+        if !status.is_success() {
+            let body_preview = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unreadable body>".to_string());
+            let body_preview = body_preview.trim().replace('\n', " ");
+            return Err(anyhow::anyhow!(
+                "Download request failed for {} (status {}): {}",
+                quant.filename,
+                status,
+                truncate_preview(&body_preview, 200)
+            ));
+        }
 
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&part_path)?;
+        let mut file = if start_offset > 0 && status != StatusCode::PARTIAL_CONTENT {
+            start_offset = 0;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&part_path)?
+        } else {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&part_path)?
+        };
+
+        let server_total_size = response.content_length().map(|c| c + start_offset);
+        let total_size = server_total_size.unwrap_or(quant.size_bytes);
 
         let mut downloaded = start_offset;
         let mut last_update = std::time::Instant::now();
@@ -104,7 +130,7 @@ impl Downloader {
             let elapsed = last_update.elapsed();
             if elapsed.as_millis() >= 500 {
                 let speed_bps = bytes_since_last as u64 * 1000 / elapsed.as_millis().max(1) as u64;
-                let remaining = total_size - downloaded;
+                let remaining = total_size.saturating_sub(downloaded);
                 let eta = if speed_bps > 0 {
                     remaining / speed_bps
                 } else {
@@ -129,20 +155,28 @@ impl Downloader {
         // Final flush
         file.flush()?;
 
-        // Rename to final location
-        std::fs::rename(&part_path, &dest_path)?;
-
-        // Verify size (allow 5% tolerance)
-        let final_size = std::fs::metadata(&dest_path)?.len();
-        let min_size = quant.size_bytes * 95 / 100;
-        let max_size = quant.size_bytes * 105 / 100;
-        if final_size < min_size || final_size > max_size {
+        // Validate final size. Prefer exact server-reported size when available.
+        let final_size = std::fs::metadata(&part_path)?.len();
+        if let Some(expected_server_size) = server_total_size {
+            if final_size != expected_server_size {
+                let _ = std::fs::remove_file(&part_path);
+                return Err(anyhow::anyhow!(
+                    "Downloaded size mismatch: expected {}, got {}",
+                    expected_server_size,
+                    final_size
+                ));
+            }
+        } else if !is_compatible_quant_size(final_size, quant.size_bytes) {
+            let _ = std::fs::remove_file(&part_path);
             return Err(anyhow::anyhow!(
                 "Downloaded size mismatch: expected ~{}, got {}",
                 quant.size_bytes,
                 final_size
             ));
         }
+
+        // Rename to final location only after validation
+        std::fs::rename(&part_path, &dest_path)?;
 
         Ok(dest_path)
     }
@@ -152,4 +186,11 @@ impl Default for Downloader {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn truncate_preview(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    input.chars().take(max_chars).collect::<String>() + "..."
 }

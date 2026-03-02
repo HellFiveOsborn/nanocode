@@ -3,12 +3,14 @@
 use super::base::Tool;
 use crate::config::NcConfig;
 use crate::types::{AvailableTool, InvokeContext, ToolError, ToolOutput, ToolPermission};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::RwLock;
 
 pub struct ToolManager {
     tools: HashMap<String, Arc<dyn Tool>>,
-    configs: HashMap<String, ToolConfig>,
+    configs: RwLock<HashMap<String, ToolConfig>>,
+    enabled_tools: RwLock<Option<HashSet<String>>>,
 }
 
 #[derive(Clone)]
@@ -124,7 +126,11 @@ impl ToolManager {
             );
         }
 
-        Self { tools, configs }
+        Self {
+            tools,
+            configs: RwLock::new(configs),
+            enabled_tools: RwLock::new(None),
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
@@ -152,19 +158,31 @@ impl ToolManager {
     }
 
     pub fn available_tools(&self) -> Vec<&dyn Tool> {
-        self.tools.values().map(|t| t.as_ref()).collect()
+        self.tools
+            .iter()
+            .filter_map(|(name, tool)| {
+                if self.is_tool_enabled(name) {
+                    Some(tool.as_ref())
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     pub fn get_available_tools_schema(&self) -> Vec<AvailableTool> {
         self.tools
-            .values()
-            .map(|t| {
+            .iter()
+            .filter_map(|(name, t)| {
+                if !self.is_tool_enabled(name) {
+                    return None;
+                }
                 let t = t.as_ref();
-                AvailableTool {
+                Some(AvailableTool {
                     name: t.name().to_string(),
                     description: t.description().to_string(),
                     parameters: t.parameters_schema(),
-                }
+                })
             })
             .collect()
     }
@@ -179,8 +197,53 @@ impl ToolManager {
 
         // Then check global config
         self.configs
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(name)
             .map(|c| c.permission)
             .unwrap_or(ToolPermission::Ask)
+    }
+
+    pub fn set_permission(&self, tool_name: &str, permission: ToolPermission) -> bool {
+        let mut configs = self
+            .configs
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(config) = configs.get_mut(tool_name) {
+            config.permission = permission;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn set_enabled_tools(&self, enabled_tools: HashSet<String>) {
+        let mut guard = self
+            .enabled_tools
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(enabled_tools);
+    }
+
+    pub fn clear_enabled_tools_filter(&self) {
+        let mut guard = self
+            .enabled_tools
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = None;
+    }
+
+    pub fn is_tool_enabled(&self, tool_name: &str) -> bool {
+        if !self.has_tool(tool_name) {
+            return false;
+        }
+        let enabled = self
+            .enabled_tools
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        enabled
+            .as_ref()
+            .map(|set| set.contains(tool_name))
+            .unwrap_or(true)
     }
 }

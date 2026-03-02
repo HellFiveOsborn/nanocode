@@ -6,6 +6,9 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NcConfig {
+    /// Currently active model id
+    pub active_model: Option<String>,
+
     /// Currently active quantization
     pub active_quant: Option<String>,
 
@@ -184,7 +187,7 @@ impl Default for ToolsConfig {
                 ]),
             },
             read_file: ToolPolicyConfig {
-                permission: ToolPermissionConfig::Always,
+                permission: ToolPermissionConfig::Ask,
                 allowlist: None,
                 denylist: None,
             },
@@ -194,7 +197,7 @@ impl Default for ToolsConfig {
                 denylist: None,
             },
             grep: ToolPolicyConfig {
-                permission: ToolPermissionConfig::Always,
+                permission: ToolPermissionConfig::Ask,
                 allowlist: None,
                 denylist: None,
             },
@@ -261,6 +264,7 @@ impl Default for UiConfig {
 impl Default for NcConfig {
     fn default() -> Self {
         Self {
+            active_model: None,
             active_quant: None,
             auto_approve: false,
             auto_compact_threshold: 32_000,
