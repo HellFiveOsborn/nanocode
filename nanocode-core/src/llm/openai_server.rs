@@ -90,7 +90,7 @@ impl LocalOpenAiServer {
     pub async fn start(model_path: &Path, config: &NcConfig) -> Result<Self, String> {
         let engine = LlmEngine::new(model_path, config)?;
         let state = AppState {
-            engine: Arc::new(LlmEngineHandle::new(engine)),
+            engine: Arc::new(LlmEngineHandle::new(engine).map_err(|e| e.to_string())?),
         };
 
         let app = Router::new()
@@ -154,6 +154,56 @@ pub async fn chat_via_openai_server(
     .await
 }
 
+/// Run inference using a shared, pre-loaded engine handle (model stays in memory).
+pub async fn chat_via_engine_streaming<F>(
+    engine: Arc<LlmEngineHandle>,
+    messages: &[LlmMessage],
+    max_tokens: u32,
+    tools: Option<serde_json::Value>,
+    tool_choice: Option<serde_json::Value>,
+    interrupt_signal: Option<Arc<AtomicBool>>,
+    mut on_chunk: F,
+) -> Result<String, String>
+where
+    F: FnMut(String),
+{
+    let messages = messages.to_vec();
+    let tools_owned = tools.clone();
+    let tool_choice_owned = tool_choice.clone();
+    let interrupt_signal_owned = interrupt_signal.clone();
+    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    let mut generate_task = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let mut callback = |chunk: &str| -> bool {
+            if !chunk.is_empty() {
+                let _ = chunk_tx.send(chunk.to_string());
+            }
+            check_interrupt_signal(interrupt_signal_owned.as_ref()).is_ok()
+        };
+        engine.generate_with_chunk_callback(
+            &messages,
+            max_tokens,
+            tools_owned,
+            tool_choice_owned,
+            &mut callback,
+        )
+    });
+
+    loop {
+        tokio::select! {
+            maybe_chunk = chunk_rx.recv() => {
+                if let Some(chunk) = maybe_chunk {
+                    on_chunk(chunk);
+                }
+            }
+            task_result = &mut generate_task => {
+                return task_result.map_err(|e| format!("inference task join failed: {e}"))?;
+            }
+        }
+    }
+}
+
+/// Run inference loading a fresh model per call (legacy — prefer `chat_via_engine_streaming`).
 pub async fn chat_via_openai_server_streaming<F>(
     model_path: &Path,
     config: &NcConfig,
@@ -176,8 +226,8 @@ where
     let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     let mut generate_task = tokio::task::spawn_blocking(move || -> Result<String, String> {
-        let engine = LlmEngine::new(&model_path, &config)?;
-        let handle = LlmEngineHandle::new(engine);
+        let loaded = super::inference::LoadedModel::load(&model_path, &config)?;
+        let handle = LlmEngineHandle::from_loaded(loaded);
         let mut callback = |chunk: &str| -> bool {
             if !chunk.is_empty() {
                 let _ = chunk_tx.send(chunk.to_string());

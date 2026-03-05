@@ -89,6 +89,9 @@ impl Tool for TaskTool {
         }
 
         let mut subloop = AgentLoop::new(runtime_config.clone(), tool_manager);
+        if let Some(engine) = &ctx.llm_engine {
+            subloop.set_llm_engine(engine.clone());
+        }
         subloop.set_agent_name(policy.builtin.as_str());
         subloop.add_system_message(load_prompt(PromptFamily::Qwen3, policy.prompt_variant));
         subloop.add_user_message(task.to_string());
@@ -340,6 +343,8 @@ mod tests {
             subagent_progress_tx: None,
             runtime_config: Some(config.clone()),
             runtime_model_path: Some(PathBuf::from("/tmp/from-parent.gguf")),
+            llm_engine: None,
+            bash_kill_signal: None,
         };
 
         let (resolved_config, resolved_model) =

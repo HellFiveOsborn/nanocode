@@ -8,7 +8,8 @@ use std::sync::Arc;
 use crate::config::NcConfig;
 use crate::interrupt::{check_interrupt_signal, is_user_interrupted_error};
 use crate::llm::{
-    build_available_tools_schema, chat_via_openai_server_streaming, parse_tool_calls, tools_to_json,
+    build_available_tools_schema, chat_via_engine_streaming, chat_via_openai_server_streaming,
+    parse_tool_calls, tools_to_json, LlmEngineHandle,
 };
 use crate::middleware::{
     AutoCompactMiddleware, ContextWarningMiddleware, ConversationContext, MiddlewareAction,
@@ -413,6 +414,10 @@ pub struct AgentLoop {
     question_handler:
         Option<Arc<dyn Fn(UserQuestionRequest) -> UserQuestionResponse + Send + Sync>>,
     subagent_progress_tx: Option<std::sync::mpsc::Sender<(String, crate::types::SubagentProgress)>>,
+    /// Shared pre-loaded LLM engine. When set, the model stays in memory across turns.
+    llm_engine: Option<Arc<LlmEngineHandle>>,
+    /// Kill signal for the currently running bash process.
+    bash_kill_signal: Option<crate::tools::bash::BashKillSignal>,
 }
 
 impl AgentLoop {
@@ -427,9 +432,26 @@ impl AgentLoop {
             approval_handler: None,
             question_handler: None,
             subagent_progress_tx: None,
+            llm_engine: None,
+            bash_kill_signal: None,
         };
         loop_state.setup_middleware();
         loop_state
+    }
+
+    /// Set a shared pre-loaded LLM engine so the model stays in memory across turns.
+    pub fn set_llm_engine(&mut self, engine: Arc<LlmEngineHandle>) {
+        self.llm_engine = Some(engine);
+    }
+
+    /// Get the shared LLM engine, if set.
+    pub fn llm_engine(&self) -> Option<&Arc<LlmEngineHandle>> {
+        self.llm_engine.as_ref()
+    }
+
+    /// Set a shared bash kill signal used by bash tool invocations.
+    pub fn set_bash_kill_signal(&mut self, signal: crate::tools::bash::BashKillSignal) {
+        self.bash_kill_signal = Some(signal);
     }
 
     fn setup_middleware(&mut self) {
@@ -579,6 +601,42 @@ impl AgentLoop {
         self.question_handler = Some(Arc::new(handler));
     }
 
+    /// Internal: dispatch LLM call via shared engine or legacy per-call path.
+    async fn llm_call(
+        &self,
+        model_path: &Path,
+        messages: &[LlmMessage],
+        max_tokens: u32,
+        tools: Option<serde_json::Value>,
+        tool_choice: Option<serde_json::Value>,
+        interrupt_signal: Option<Arc<AtomicBool>>,
+    ) -> Result<String, String> {
+        if let Some(engine) = &self.llm_engine {
+            chat_via_engine_streaming(
+                engine.clone(),
+                messages,
+                max_tokens,
+                tools,
+                tool_choice,
+                interrupt_signal,
+                |_| {},
+            )
+            .await
+        } else {
+            chat_via_openai_server_streaming(
+                model_path,
+                &self.config,
+                messages,
+                max_tokens,
+                tools,
+                tool_choice,
+                interrupt_signal,
+                |_| {},
+            )
+            .await
+        }
+    }
+
     /// Execute full multi-turn loop with tool-calling.
     pub async fn act(&mut self, model_path: &Path, max_tokens: u32) -> Result<String, String> {
         self.act_with_events(model_path, max_tokens, |_| {}).await
@@ -695,19 +753,34 @@ impl AgentLoop {
             self.stats.context_tokens = prompt_tokens_estimate;
 
             check_interrupt_signal(interrupt_signal.as_ref())?;
-            let assistant_text = chat_via_openai_server_streaming(
-                model_path,
-                &self.config,
-                &effective_messages,
-                max_tokens,
-                tools_value.clone(),
-                tool_choice,
-                interrupt_signal.clone(),
-                |chunk| {
-                    on_event(LoopEvent::Chunk(chunk));
-                },
-            )
-            .await?;
+            let assistant_text = if let Some(engine) = &self.llm_engine {
+                chat_via_engine_streaming(
+                    engine.clone(),
+                    &effective_messages,
+                    max_tokens,
+                    tools_value.clone(),
+                    tool_choice,
+                    interrupt_signal.clone(),
+                    |chunk| {
+                        on_event(LoopEvent::Chunk(chunk));
+                    },
+                )
+                .await?
+            } else {
+                chat_via_openai_server_streaming(
+                    model_path,
+                    &self.config,
+                    &effective_messages,
+                    max_tokens,
+                    tools_value.clone(),
+                    tool_choice,
+                    interrupt_signal.clone(),
+                    |chunk| {
+                        on_event(LoopEvent::Chunk(chunk));
+                    },
+                )
+                .await?
+            };
             check_interrupt_signal(interrupt_signal.as_ref())?;
 
             self.stats.turns += 1;
@@ -841,6 +914,18 @@ impl AgentLoop {
             ToolPermission::Always | ToolPermission::Ask => {}
         }
 
+        // Reset bash kill signal before each bash invocation.
+        let bash_signal = if call.name == "bash" {
+            if let Some(ref sig) = self.bash_kill_signal {
+                sig.store(false, std::sync::atomic::Ordering::Relaxed);
+                Some(sig.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let ctx = InvokeContext {
             tool_call_id: call.id.clone(),
             approval_tx: None,
@@ -848,6 +933,8 @@ impl AgentLoop {
             subagent_progress_tx: self.subagent_progress_tx.clone(),
             runtime_config: Some(self.config.clone()),
             runtime_model_path: Some(model_path.to_path_buf()),
+            llm_engine: self.llm_engine.clone(),
+            bash_kill_signal: bash_signal,
         };
 
         match self
@@ -879,15 +966,13 @@ impl AgentLoop {
         let mut summary_result = {
             let mut summary_messages = compact_input.clone();
             summary_messages.push(LlmMessage::user(COMPACT_SUMMARY_PROMPT));
-            chat_via_openai_server_streaming(
+            self.llm_call(
                 model_path,
-                &self.config,
                 &summary_messages,
                 summary_max_tokens,
                 None,
                 None,
                 interrupt_signal.clone(),
-                |_| {},
             )
             .await
         };
@@ -901,17 +986,16 @@ impl AgentLoop {
 
                 let mut retry_messages = compact_input;
                 retry_messages.push(LlmMessage::user(COMPACT_SUMMARY_PROMPT));
-                summary_result = chat_via_openai_server_streaming(
-                    model_path,
-                    &self.config,
-                    &retry_messages,
-                    summary_max_tokens,
-                    None,
-                    None,
-                    interrupt_signal.clone(),
-                    |_| {},
-                )
-                .await;
+                summary_result = self
+                    .llm_call(
+                        model_path,
+                        &retry_messages,
+                        summary_max_tokens,
+                        None,
+                        None,
+                        interrupt_signal.clone(),
+                    )
+                    .await;
             }
         }
 

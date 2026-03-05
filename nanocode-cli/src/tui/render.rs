@@ -235,7 +235,7 @@ fn format_elapsed_clock(elapsed_secs: u64) -> String {
 
 fn input_prompt_prefix(mode: InputMode) -> &'static str {
     match mode {
-        InputMode::Default => "› ",
+        InputMode::Default => "❯ ",
         InputMode::Slash => "/ ",
     }
 }
@@ -338,7 +338,7 @@ fn rail_line(rail_color: Color, content: Vec<Span<'static>>) -> Line<'static> {
 
 fn tool_detail_line(_first: bool, theme: UiTheme, content: Vec<Span<'static>>) -> Line<'static> {
     let mut spans = Vec::with_capacity(content.len() + 1);
-    spans.push(Span::styled("  │ ", Style::default().fg(theme.muted)));
+    spans.push(Span::styled("  ⎿  ", Style::default().fg(theme.muted)));
     spans.extend(content);
     Line::from(spans)
 }
@@ -350,9 +350,22 @@ fn explore_detail_line(theme: UiTheme, content: Vec<Span<'static>>) -> Line<'sta
     Line::from(spans)
 }
 
-fn render_tool_output_lines(output: &str, theme: UiTheme) -> Vec<Line<'static>> {
+const TOOL_OUTPUT_PREVIEW_LINES: usize = 5;
+
+fn render_tool_output_lines(
+    output: &str,
+    theme: UiTheme,
+    collapsed: bool,
+) -> Vec<Line<'static>> {
+    let raw_lines = text_lines_or_empty(output);
+    let total = raw_lines.len();
+    let limit = if collapsed {
+        TOOL_OUTPUT_PREVIEW_LINES
+    } else {
+        total
+    };
     let mut lines = Vec::new();
-    for (idx, raw) in text_lines_or_empty(output).iter().enumerate() {
+    for (idx, raw) in raw_lines.iter().take(limit).enumerate() {
         let style = if raw.contains("[stderr]") {
             Style::default().fg(theme.warning)
         } else {
@@ -362,6 +375,17 @@ fn render_tool_output_lines(output: &str, theme: UiTheme) -> Vec<Line<'static>> 
             idx == 0,
             theme,
             vec![Span::styled(raw.to_string(), style)],
+        ));
+    }
+    if collapsed && total > TOOL_OUTPUT_PREVIEW_LINES {
+        let remaining = total - TOOL_OUTPUT_PREVIEW_LINES;
+        lines.push(tool_detail_line(
+            false,
+            theme,
+            vec![Span::styled(
+                format!("… +{} lines (ctrl+r to expand)", remaining),
+                Style::default().fg(theme.muted),
+            )],
         ));
     }
     lines
@@ -1223,13 +1247,34 @@ fn render_chat_lines(
                 theme,
             )),
             ChatItem::User(text) => {
-                for line in text_lines_or_empty(text) {
-                    lines.push(Line::from(vec![Span::styled(
-                        line.to_string(),
-                        Style::default()
-                            .fg(theme.accent)
-                            .add_modifier(Modifier::BOLD),
-                    )]));
+                let text_lines = text_lines_or_empty(text);
+                for (idx, line) in text_lines.iter().enumerate() {
+                    if idx == 0 {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                "❯ ",
+                                Style::default()
+                                    .fg(theme.accent)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                line.to_string(),
+                                Style::default()
+                                    .fg(theme.fg)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ]));
+                    } else {
+                        lines.push(Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled(
+                                line.to_string(),
+                                Style::default()
+                                    .fg(theme.fg)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ]));
+                    }
                 }
                 lines.push(Line::raw(""));
             }
@@ -1292,6 +1337,7 @@ fn render_chat_lines(
                 diff,
                 state,
                 subagent,
+                started_at,
             } => {
                 // ── Subagent (Explore) teleprompter-style rendering ──
                 if let Some(tracking) = subagent {
@@ -1428,14 +1474,28 @@ fn render_chat_lines(
                     lines.push(Line::raw(""));
                 } else {
                     // ── Regular tool rendering ──
-                    let bullet_color = match state {
-                        ToolState::Running => theme.fg,
-                        ToolState::Ok | ToolState::Error => theme.info_blue,
+                    let is_running = matches!(state, ToolState::Running);
+                    let is_error = matches!(state, ToolState::Error);
+
+                    // Blinking bullet: alternate visibility when running
+                    let bullet_visible = if is_running {
+                        (spin / 3) % 2 == 0
+                    } else {
+                        true
                     };
+                    let bullet_char = if bullet_visible { "● " } else { "  " };
+                    let bullet_color = if is_running {
+                        theme.warning
+                    } else if is_error {
+                        theme.danger
+                    } else {
+                        theme.accent
+                    };
+
                     let (tool_label, tool_suffix) = split_tool_summary(summary);
                     lines.push(Line::from(vec![
                         Span::styled(
-                            "● ",
+                            bullet_char,
                             Style::default()
                                 .fg(bullet_color)
                                 .add_modifier(Modifier::BOLD),
@@ -1447,38 +1507,61 @@ fn render_chat_lines(
                         Span::styled(tool_suffix.to_string(), Style::default().fg(theme.fg)),
                     ]));
 
-                    let has_tool_details = output.is_some() || code.is_some() || diff.is_some();
-                    if let Some(s) = stream {
-                        lines.push(tool_detail_line(
-                            true,
-                            theme,
-                            vec![Span::styled(
-                                s.to_string(),
-                                Style::default().fg(theme.muted),
-                            )],
-                        ));
-                    }
-
-                    if has_tool_details {
-                        if tools_collapsed {
+                    // Running state: show elapsed time + ctrl+b hint for bash
+                    if is_running {
+                        let elapsed_secs = started_at
+                            .map(|t| t.elapsed().as_secs())
+                            .unwrap_or(0);
+                        let elapsed_str = format_elapsed_clock(elapsed_secs);
+                        let hint = if tool_name == "bash" {
+                            format!(
+                                "Executando… ({})\n     ctrl+b para visualizar processos",
+                                elapsed_str
+                            )
+                        } else {
+                            format!("Executando… ({})", elapsed_str)
+                        };
+                        for hint_line in hint.lines() {
                             lines.push(tool_detail_line(
                                 true,
                                 theme,
                                 vec![Span::styled(
-                                    "▸ detalhes ocultos (Ctrl+R para mostrar)",
+                                    hint_line.to_string(),
                                     Style::default().fg(theme.muted),
                                 )],
                             ));
+                        }
+                    } else {
+                        // Completed: show status line
+                        if let Some(s) = stream {
+                            lines.push(tool_detail_line(
+                                true,
+                                theme,
+                                vec![Span::styled(
+                                    s.to_string(),
+                                    Style::default().fg(theme.muted),
+                                )],
+                            ));
+                        }
+                    }
+
+                    let has_tool_details = output.is_some() || code.is_some() || diff.is_some();
+                    if has_tool_details && !is_running {
+                        if tools_collapsed {
+                            if let Some(out) = output {
+                                // Show preview even when collapsed
+                                lines.extend(render_tool_output_lines(out, theme, true));
+                            }
                         } else {
                             if let Some(out) = output {
-                                lines.extend(render_tool_output_lines(out, theme));
+                                lines.extend(render_tool_output_lines(out, theme, false));
                             }
                             if code_blocks_collapsed && (code.is_some() || diff.is_some()) {
                                 lines.push(tool_detail_line(
                                     true,
                                     theme,
                                     vec![Span::styled(
-                                        "▸ código/diff oculto (Ctrl+O para mostrar)",
+                                        "▸ código/diff oculto (ctrl+o para mostrar)",
                                         Style::default().fg(theme.muted),
                                     )],
                                 ));
@@ -2943,6 +3026,55 @@ fn render_chat_screen(frame: &mut ratatui::Frame<'_>, app: &AppState, size: Rect
         let loading = Paragraph::new(vec![render_loading_line(app, theme)])
             .style(Style::default().bg(theme.bg).fg(theme.fg));
         frame.render_widget(loading, root[3]);
+    }
+
+    // Process viewer overlay
+    if app.process_viewer_open && !app.running_bash_call_ids.is_empty() {
+        let process_h: u16 = (app.running_bash_call_ids.len() as u16 + 4).min(size.height / 3);
+        let process_w = (size.width * 2 / 3).max(40).min(size.width);
+        let x = (size.width.saturating_sub(process_w)) / 2;
+        let y = (size.height.saturating_sub(process_h)) / 2;
+        let area = Rect::new(x, y, process_w, process_h);
+        frame.render_widget(Clear, area);
+        let process_box = Block::default()
+            .borders(Borders::ALL)
+            .title("processos ativos")
+            .title_alignment(Alignment::Center)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.accent).bg(theme.bg));
+        let inner = process_box.inner(area);
+        frame.render_widget(process_box, area);
+
+        let mut lines = Vec::new();
+        for (_, summary, started) in &app.running_bash_call_ids {
+            let elapsed = started.elapsed().as_secs();
+            let elapsed_str = format_elapsed_clock(elapsed);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "● ",
+                    Style::default()
+                        .fg(theme.warning)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    short_preview(summary, 60),
+                    Style::default().fg(theme.fg),
+                ),
+                Span::styled(
+                    format!("  ({})", elapsed_str),
+                    Style::default().fg(theme.muted),
+                ),
+            ]));
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![Span::styled(
+            "K encerrar processo  ·  Esc/Ctrl+B fechar",
+            Style::default().fg(theme.muted),
+        )]));
+        let process_widget = Paragraph::new(lines)
+            .style(Style::default().bg(theme.bg).fg(theme.fg))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(process_widget, inner);
     }
 
     let telemetry = Paragraph::new(vec![render_telemetry_line(app, theme)])

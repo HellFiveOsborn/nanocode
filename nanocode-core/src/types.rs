@@ -358,6 +358,10 @@ pub struct InvokeContext {
     pub runtime_config: Option<NcConfig>,
     /// Active model path from the parent loop (used by task/subagent execution).
     pub runtime_model_path: Option<PathBuf>,
+    /// Shared pre-loaded LLM engine from the parent loop (avoids reloading model for subagents).
+    pub llm_engine: Option<Arc<crate::llm::LlmEngineHandle>>,
+    /// Kill signal for the bash tool — when set to true, the running process is terminated.
+    pub bash_kill_signal: Option<crate::tools::bash::BashKillSignal>,
 }
 
 /// Approval request for a tool

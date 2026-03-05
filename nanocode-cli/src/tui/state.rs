@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::mpsc::SyncSender;
 use std::time::Instant;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ToolState {
     Running,
     Ok,
@@ -52,6 +52,7 @@ pub enum ChatItem {
         diff: Option<String>,
         state: ToolState,
         subagent: Option<SubagentTracking>,
+        started_at: Option<Instant>,
     },
     Error(String),
 }
@@ -348,6 +349,8 @@ pub struct AppState {
     pub current_session_id: Option<String>,
     pub busy_started_at: Option<Instant>,
     pub stats: AgentStats,
+    pub process_viewer_open: bool,
+    pub running_bash_call_ids: Vec<(String, String, Instant)>,
 }
 
 impl AppState {
@@ -406,6 +409,8 @@ impl AppState {
             current_session_id: None,
             busy_started_at: Some(Instant::now()),
             stats: AgentStats::default(),
+            process_viewer_open: false,
+            running_bash_call_ids: Vec::new(),
         }
     }
 }

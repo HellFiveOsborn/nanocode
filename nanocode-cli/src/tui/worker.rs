@@ -1,10 +1,11 @@
 use nanocode_core::agent_loop::{AgentLoop, LoopEvent};
 use nanocode_core::agents::{AgentPolicy, BuiltinAgent};
 use nanocode_core::interrupt::{clear_interrupt_signal, is_user_interrupted_error};
-use nanocode_core::llm::PromptFamily;
+use nanocode_core::llm::{LlmEngineHandle, LoadedModel, PromptFamily};
 use nanocode_core::prompts::load_prompt;
 use nanocode_core::session::SessionLogger;
 use nanocode_core::skills::SkillManager;
+use nanocode_core::tools::bash::{new_kill_signal, BashKillSignal};
 use nanocode_core::tools::ToolManager;
 use nanocode_core::types::{LlmMessage, MessageRole};
 use nanocode_core::{AgentStats, ApprovalDecision, NcConfig, UserQuestionResponse};
@@ -787,17 +788,47 @@ pub fn spawn_worker(
     interrupt_signal: Arc<AtomicBool>,
     resume_session_id: Option<String>,
     initial_messages: Vec<LlmMessage>,
-) -> Receiver<WorkerEvent> {
+) -> (Receiver<WorkerEvent>, BashKillSignal) {
     let (evt_tx, evt_rx) = channel::<WorkerEvent>();
+    let bash_kill_signal = new_kill_signal();
+    let bash_kill_signal_inner = bash_kill_signal.clone();
 
     tokio::spawn(async move {
         let effective_config = runtime.config.clone();
+
+        // Load model once into memory (blocking). Reused for the entire session.
+        let model_file = runtime.model_file.clone();
+        let load_config = effective_config.clone();
+        let loaded_model = tokio::task::spawn_blocking(move || {
+            LoadedModel::load(&model_file, &load_config)
+        })
+        .await;
+        let llm_engine: Option<Arc<LlmEngineHandle>> = match loaded_model {
+            Ok(Ok(loaded)) => Some(Arc::new(LlmEngineHandle::from_loaded(loaded))),
+            Ok(Err(err)) => {
+                let _ = evt_tx.send(WorkerEvent::Error(format!(
+                    "Falha ao carregar modelo: {err}"
+                )));
+                None
+            }
+            Err(err) => {
+                let _ = evt_tx.send(WorkerEvent::Error(format!(
+                    "Falha ao carregar modelo (join): {err}"
+                )));
+                None
+            }
+        };
+
         let tool_manager = ToolManager::new(&effective_config).await;
         apply_agent_tool_filter(&tool_manager, &agent_policy);
         for (tool_name, permission) in &agent_policy.tool_permission_overrides {
             let _ = tool_manager.set_permission(tool_name, *permission);
         }
         let mut loop_engine = AgentLoop::new(effective_config.clone(), tool_manager);
+        if let Some(engine) = &llm_engine {
+            loop_engine.set_llm_engine(engine.clone());
+        }
+        loop_engine.set_bash_kill_signal(bash_kill_signal_inner);
         loop_engine.set_agent_name(agent_policy.builtin.as_str());
         let session_logger = match resume_session_id.as_deref() {
             Some(session_id) => SessionLogger::resume(&NcConfig::sessions_dir(), session_id),
@@ -1323,7 +1354,7 @@ pub fn spawn_worker(
         let _ = session_logger.finish();
     });
 
-    evt_rx
+    (evt_rx, bash_kill_signal)
 }
 
 fn apply_agent_tool_filter(tool_manager: &ToolManager, agent_policy: &AgentPolicy) {

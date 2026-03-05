@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use nanocode_core::agent_loop::{AgentLoop, LoopEvent};
 use nanocode_core::agents::{AgentPolicy, BuiltinAgent};
-use nanocode_core::llm::PromptFamily;
+use nanocode_core::llm::{LlmEngineHandle, LoadedModel, PromptFamily};
 use nanocode_core::prompts::load_prompt;
 use nanocode_core::session::{find_session_path_by_id_sync, latest_session_id_sync};
 use nanocode_core::skills::{install_bundled_skills_if_missing, SkillManager};
@@ -705,12 +705,24 @@ async fn run_prompt(
         .min(runtime_limits.max_tokens)
         .clamp(512, 8192);
 
+    // Load model once into memory (blocking) so it persists across turns.
+    let model_file_for_load = model_file.clone();
+    let load_config = runtime_config.clone();
+    let loaded_model = tokio::task::spawn_blocking(move || {
+        LoadedModel::load(&model_file_for_load, &load_config)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("Falha ao carregar modelo (join): {e}"))?
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let llm_engine = std::sync::Arc::new(LlmEngineHandle::from_loaded(loaded_model));
+
     let tool_manager = ToolManager::new(&runtime_config).await;
     apply_agent_tool_filter(&tool_manager, &agent_policy);
     for (tool_name, permission) in &agent_policy.tool_permission_overrides {
         let _ = tool_manager.set_permission(tool_name, *permission);
     }
     let mut loop_engine = AgentLoop::new(runtime_config.clone(), tool_manager);
+    loop_engine.set_llm_engine(llm_engine);
     loop_engine.set_agent_name(agent_policy.builtin.as_str());
     loop_engine.set_approval_handler(|request| {
         println!();

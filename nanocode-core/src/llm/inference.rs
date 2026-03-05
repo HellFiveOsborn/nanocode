@@ -14,22 +14,65 @@ use serde_json::{json, Value};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
-/// LLM inference engine using embedded llama.cpp runtime
-pub struct LlmEngine {
-    model_path: PathBuf,
+/// Persistent LLM model loaded in memory.
+///
+/// Holds the llama.cpp backend and model across calls so the expensive
+/// model-load happens only once. A new context is created per generate call.
+pub struct LoadedModel {
+    backend: LlamaBackend,
+    model: LlamaModel,
     config: NcConfig,
+    model_path: PathBuf,
 }
 
-impl LlmEngine {
-    /// Create a new engine
-    pub fn new(model_path: &Path, config: &NcConfig) -> Result<Self, String> {
+impl LoadedModel {
+    /// Load the model from disk. This is the expensive one-time operation.
+    pub fn load(model_path: &Path, config: &NcConfig) -> Result<Self, String> {
+        let mut backend =
+            LlamaBackend::init().map_err(|e| format!("llama backend init failed: {e}"))?;
+        backend.void_logs();
+
+        let auto_gpu_layers = config.model.n_gpu_layers < 0;
+        let wants_gpu_layers = if auto_gpu_layers {
+            u32::MAX
+        } else {
+            config.model.n_gpu_layers as u32
+        };
+
+        let n_gpu_layers = if backend.supports_gpu_offload() {
+            wants_gpu_layers
+        } else {
+            if wants_gpu_layers > 0 {
+                eprintln!(
+                    "Aviso: backend atual sem GPU offload. Executando em CPU-only (n_gpu_layers=0)."
+                );
+            }
+            0
+        };
+
+        let model =
+            load_model_with_fallback(&backend, model_path, n_gpu_layers, auto_gpu_layers)
+                .map_err(|err| {
+                    format!(
+                        "failed to load model '{}': {err}",
+                        model_path.display()
+                    )
+                })?;
+
         Ok(Self {
-            model_path: model_path.to_path_buf(),
+            backend,
+            model,
             config: config.clone(),
+            model_path: model_path.to_path_buf(),
         })
     }
 
-    /// Generate completion
+    /// Path of the loaded model file.
+    pub fn model_path(&self) -> &Path {
+        &self.model_path
+    }
+
+    /// Generate a completion reusing the already-loaded model.
     pub fn generate(
         &self,
         messages: &[LlmMessage],
@@ -48,36 +91,6 @@ impl LlmEngine {
         tool_choice: Option<serde_json::Value>,
         mut on_chunk: Option<&mut dyn FnMut(&str) -> bool>,
     ) -> Result<String, String> {
-        let mut backend =
-            LlamaBackend::init().map_err(|e| format!("llama backend init failed: {e}"))?;
-        backend.void_logs();
-
-        let auto_gpu_layers = self.config.model.n_gpu_layers < 0;
-        let wants_gpu_layers = if auto_gpu_layers {
-            u32::MAX
-        } else {
-            self.config.model.n_gpu_layers as u32
-        };
-
-        let n_gpu_layers = if backend.supports_gpu_offload() {
-            wants_gpu_layers
-        } else {
-            if wants_gpu_layers > 0 {
-                eprintln!(
-                    "Aviso: backend atual sem GPU offload. Executando em CPU-only (n_gpu_layers=0)."
-                );
-            }
-            0
-        };
-
-        let model = load_model_with_fallback(&backend, &self.model_path, n_gpu_layers, auto_gpu_layers)
-            .map_err(|err| {
-                format!(
-                    "failed to load model '{}': {err}",
-                    self.model_path.display()
-                )
-            })?;
-
         let ctx_size = self
             .config
             .model
@@ -98,14 +111,14 @@ impl LlmEngine {
             None => None,
         };
         let template_result = self.build_prompt(
-            &model,
             messages,
             tools_json_owned.as_deref(),
             tool_choice_json,
             None,
         )?;
         let prompt = &template_result.prompt;
-        let tokens = model
+        let tokens = self
+            .model
             .str_to_token(prompt, AddBos::Never)
             .map_err(|e| format!("failed to tokenize prompt: {e}"))?;
 
@@ -138,21 +151,36 @@ impl LlmEngine {
         let flash_attention = self.config.model.flash_attention.unwrap_or(false);
 
         let config_n_batch = self.config.model.n_batch.unwrap_or(0);
-        let context_candidates =
-            build_context_candidates(ctx_size, tokens.len() as u32, requested_k_type, requested_v_type, config_n_batch);
+        let context_candidates = build_context_candidates(
+            ctx_size,
+            tokens.len() as u32,
+            requested_k_type,
+            requested_v_type,
+            config_n_batch,
+        );
         let mut context_errors = Vec::new();
         let mut used_fallback = false;
         let mut used_candidate = context_candidates[0];
         let mut ctx: Option<_> = None;
 
         for (idx, candidate) in context_candidates.iter().copied().enumerate() {
-            let thread_count = if n_threads > 0 { n_threads as i32 } else { num_cpus::get_physical().max(1) as i32 };
-            let batch_threads = if n_threads > 0 { n_threads as i32 } else { num_cpus::get().max(1) as i32 };
+            let thread_count = if n_threads > 0 {
+                n_threads as i32
+            } else {
+                num_cpus::get_physical().max(1) as i32
+            };
+            let batch_threads = if n_threads > 0 {
+                n_threads as i32
+            } else {
+                num_cpus::get().max(1) as i32
+            };
             let mut ctx_params = LlamaContextParams::default()
                 .with_n_threads(thread_count)
                 .with_n_threads_batch(batch_threads)
                 .with_n_batch(candidate.n_batch)
-                .with_n_ctx(Some(NonZeroU32::new(candidate.ctx_size).expect("ctx_size > 0")));
+                .with_n_ctx(Some(
+                    NonZeroU32::new(candidate.ctx_size).expect("ctx_size > 0"),
+                ));
             if let Some(k_type) = candidate.k_type {
                 ctx_params = ctx_params.with_type_k(k_type);
             }
@@ -165,7 +193,7 @@ impl LlmEngine {
                 );
             }
 
-            match model.new_context(&backend, ctx_params) {
+            match self.model.new_context(&self.backend, ctx_params) {
                 Ok(created_ctx) => {
                     used_fallback = idx > 0;
                     used_candidate = candidate;
@@ -256,11 +284,12 @@ impl LlmEngine {
             let token = sampler.sample(&ctx, batch.n_tokens() - 1);
             sampler.accept(token);
 
-            if model.is_eog_token(token) {
+            if self.model.is_eog_token(token) {
                 break;
             }
 
-            let piece = model
+            let piece = self
+                .model
                 .token_to_piece(token, &mut decoder, true, None)
                 .map_err(|e| format!("failed to decode token piece: {e}"))?;
             result.push_str(&piece);
@@ -309,13 +338,13 @@ impl LlmEngine {
     /// Build prompt from messages using model chat template
     fn build_prompt(
         &self,
-        model: &LlamaModel,
         messages: &[LlmMessage],
         tools_json: Option<&str>,
         tool_choice_json: Option<&str>,
         tool_grammar: Option<&str>,
     ) -> Result<ChatTemplateResult, String> {
-        let template = model
+        let template = self
+            .model
             .chat_template(None)
             .map_err(|e| format!("failed to read model chat template: {e}"))?;
 
@@ -373,9 +402,103 @@ impl LlmEngine {
             parse_tool_calls: true,
         };
 
-        model
+        self.model
             .apply_chat_template_oaicompat(&template, &params)
             .map_err(|e| format!("failed to apply chat template (oaicompat): {e}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy LlmEngine kept for backwards-compat (loads model per call)
+// ---------------------------------------------------------------------------
+
+/// LLM inference engine using embedded llama.cpp runtime (legacy per-call loader)
+pub struct LlmEngine {
+    model_path: PathBuf,
+    config: NcConfig,
+}
+
+impl LlmEngine {
+    /// Create a new engine
+    pub fn new(model_path: &Path, config: &NcConfig) -> Result<Self, String> {
+        Ok(Self {
+            model_path: model_path.to_path_buf(),
+            config: config.clone(),
+        })
+    }
+
+    /// Generate completion (loads model each call — prefer LoadedModel for persistent use)
+    pub fn generate(
+        &self,
+        messages: &[LlmMessage],
+        max_tokens: u32,
+        tools: Option<serde_json::Value>,
+        tool_choice: Option<serde_json::Value>,
+    ) -> Result<String, String> {
+        self.generate_with_chunk_callback(messages, max_tokens, tools, tool_choice, None)
+    }
+
+    pub fn generate_with_chunk_callback(
+        &self,
+        messages: &[LlmMessage],
+        max_tokens: u32,
+        tools: Option<serde_json::Value>,
+        tool_choice: Option<serde_json::Value>,
+        on_chunk: Option<&mut dyn FnMut(&str) -> bool>,
+    ) -> Result<String, String> {
+        let loaded = LoadedModel::load(&self.model_path, &self.config)?;
+        loaded.generate_with_chunk_callback(messages, max_tokens, tools, tool_choice, on_chunk)
+    }
+}
+
+/// Thread-safe wrapper that holds a persistent loaded model.
+pub struct LlmEngineHandle {
+    loaded: std::sync::Mutex<LoadedModel>,
+}
+
+impl LlmEngineHandle {
+    /// Create a handle from an already-loaded model (preferred).
+    pub fn from_loaded(loaded: LoadedModel) -> Self {
+        Self {
+            loaded: std::sync::Mutex::new(loaded),
+        }
+    }
+
+    /// Legacy: create a handle that loads the model eagerly.
+    pub fn new(engine: LlmEngine) -> Result<Self, String> {
+        let loaded = LoadedModel::load(&engine.model_path, &engine.config)?;
+        Ok(Self {
+            loaded: std::sync::Mutex::new(loaded),
+        })
+    }
+
+    pub fn generate(
+        &self,
+        messages: &[LlmMessage],
+        max_tokens: u32,
+        tools: Option<serde_json::Value>,
+        tool_choice: Option<serde_json::Value>,
+    ) -> Result<String, String> {
+        let loaded = self.loaded.lock().map_err(|e| e.to_string())?;
+        loaded.generate(messages, max_tokens, tools, tool_choice)
+    }
+
+    pub fn generate_with_chunk_callback(
+        &self,
+        messages: &[LlmMessage],
+        max_tokens: u32,
+        tools: Option<serde_json::Value>,
+        tool_choice: Option<serde_json::Value>,
+        on_chunk: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<String, String> {
+        let loaded = self.loaded.lock().map_err(|e| e.to_string())?;
+        loaded.generate_with_chunk_callback(
+            messages,
+            max_tokens,
+            tools,
+            tool_choice,
+            Some(on_chunk),
+        )
     }
 }
 
@@ -617,48 +740,6 @@ fn extract_final_answer(text: &str) -> String {
         .replace("<|im_end|>", "")
         .trim()
         .to_string()
-}
-
-/// Thread-safe wrapper for LLM engine
-pub struct LlmEngineHandle {
-    engine: std::sync::Mutex<LlmEngine>,
-}
-
-impl LlmEngineHandle {
-    pub fn new(engine: LlmEngine) -> Self {
-        Self {
-            engine: std::sync::Mutex::new(engine),
-        }
-    }
-
-    pub fn generate(
-        &self,
-        messages: &[LlmMessage],
-        max_tokens: u32,
-        tools: Option<serde_json::Value>,
-        tool_choice: Option<serde_json::Value>,
-    ) -> Result<String, String> {
-        let engine = self.engine.lock().map_err(|e| e.to_string())?;
-        engine.generate(messages, max_tokens, tools, tool_choice)
-    }
-
-    pub fn generate_with_chunk_callback(
-        &self,
-        messages: &[LlmMessage],
-        max_tokens: u32,
-        tools: Option<serde_json::Value>,
-        tool_choice: Option<serde_json::Value>,
-        on_chunk: &mut dyn FnMut(&str) -> bool,
-    ) -> Result<String, String> {
-        let engine = self.engine.lock().map_err(|e| e.to_string())?;
-        engine.generate_with_chunk_callback(
-            messages,
-            max_tokens,
-            tools,
-            tool_choice,
-            Some(on_chunk),
-        )
-    }
 }
 
 fn parse_kv_cache_type(raw: &str) -> Option<KvCacheType> {

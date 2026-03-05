@@ -252,6 +252,8 @@ mod tests {
             subagent_progress_tx: None,
             runtime_config: None,
             runtime_model_path: None,
+            llm_engine: None,
+            bash_kill_signal: None,
         };
 
         let output = tool
@@ -290,6 +292,8 @@ mod tests {
             subagent_progress_tx: None,
             runtime_config: None,
             runtime_model_path: None,
+            llm_engine: None,
+            bash_kill_signal: None,
         };
 
         let output = tool

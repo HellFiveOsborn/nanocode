@@ -298,6 +298,14 @@ fn apply_worker_event(
             } else {
                 None
             };
+            let tool_started_at = Instant::now();
+            if tool_name == "bash" {
+                app.running_bash_call_ids.push((
+                    call_id.clone(),
+                    summary.clone(),
+                    tool_started_at,
+                ));
+            }
             app.chat.push(ChatItem::Tool {
                 tool_name,
                 summary,
@@ -308,6 +316,7 @@ fn apply_worker_event(
                 diff: None,
                 state: ToolState::Running,
                 subagent,
+                started_at: Some(tool_started_at),
             });
             tool_index_by_id.insert(call_id, app.chat.len() - 1);
         }
@@ -366,6 +375,11 @@ fn apply_worker_event(
             diff,
             rewind_changes,
         } => {
+            app.running_bash_call_ids
+                .retain(|(id, _, _)| id != &call_id);
+            if app.running_bash_call_ids.is_empty() && app.process_viewer_open {
+                app.process_viewer_open = false;
+            }
             if let Some(idx) = tool_index_by_id.get(&call_id).copied() {
                 if let Some(ChatItem::Tool {
                     tool_name,
@@ -834,6 +848,7 @@ async fn handle_key_event(
     attachment_engine: &mut AttachmentEngine,
     cmd_tx: Option<&mpsc::Sender<WorkerCommand>>,
     interrupt_signal: &Arc<AtomicBool>,
+    bash_kill_signal: &nanocode_core::tools::bash::BashKillSignal,
     tool_index_by_id: &mut HashMap<String, usize>,
     rewind_manager: &mut RewindManager,
 ) -> bool {
@@ -1212,6 +1227,20 @@ async fn handle_key_event(
                 "raciocínio visível (Ctrl+T para ocultar)".to_string()
             };
         }
+        (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
+            if !app.running_bash_call_ids.is_empty() {
+                app.process_viewer_open = !app.process_viewer_open;
+                app.status = if app.process_viewer_open {
+                    "Processos ativos (K para encerrar, Ctrl+B para fechar)".to_string()
+                } else {
+                    format!("pronto · agente {}", agent_status_label(app.active_agent))
+                };
+            } else if app.process_viewer_open {
+                app.process_viewer_open = false;
+                app.status =
+                    format!("pronto · agente {}", agent_status_label(app.active_agent));
+            }
+        }
         (KeyCode::PageUp, _) => {
             app.chat_scroll = app.chat_scroll.saturating_add(5);
         }
@@ -1255,6 +1284,17 @@ async fn handle_key_event(
         }
         (KeyCode::Down, KeyModifiers::NONE) => {
             app.chat_scroll = app.chat_scroll.saturating_sub(1);
+        }
+        (KeyCode::Esc, _) if app.process_viewer_open => {
+            app.process_viewer_open = false;
+            app.status =
+                format!("pronto · agente {}", agent_status_label(app.active_agent));
+        }
+        (KeyCode::Char('k') | KeyCode::Char('K'), _)
+            if app.process_viewer_open && !app.running_bash_call_ids.is_empty() =>
+        {
+            bash_kill_signal.store(true, std::sync::atomic::Ordering::Relaxed);
+            app.status = "Encerrando processo bash...".to_string();
         }
         (KeyCode::Esc, _) if app.busy => {
             set_interrupt_signal(interrupt_signal);
@@ -2042,6 +2082,7 @@ fn start_chat_worker(
     Receiver<WorkerEvent>,
     HardwareInfo,
     u32,
+    nanocode_core::tools::bash::BashKillSignal,
 )> {
     let runtime = build_runtime(config, ctk_override, ctv_override)
         .map_err(|e| anyhow!("Falha ao inicializar runtime: {e}"))?;
@@ -2050,7 +2091,7 @@ fn start_chat_worker(
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCommand>(8);
     let agent_policy = AgentPolicy::from_builtin(active_agent);
-    let evt_rx = spawn_worker(
+    let (evt_rx, bash_kill_signal) = spawn_worker(
         runtime,
         agent_policy,
         cmd_rx,
@@ -2058,7 +2099,7 @@ fn start_chat_worker(
         resume_session_id,
         initial_messages,
     );
-    Ok((cmd_tx, evt_rx, telemetry_hw, max_context_tokens))
+    Ok((cmd_tx, evt_rx, telemetry_hw, max_context_tokens, bash_kill_signal))
 }
 
 fn start_download_task(model: &'static ModelSpec, quant_name: &str) -> Result<DownloadTask> {
@@ -2088,6 +2129,7 @@ async fn restart_chat_worker(
     worker_cmd_tx: &mut Option<mpsc::Sender<WorkerCommand>>,
     worker_evt_rx: &mut Option<Receiver<WorkerEvent>>,
     telemetry_hw: &mut HardwareInfo,
+    bash_kill_signal_out: &mut nanocode_core::tools::bash::BashKillSignal,
     app: &mut AppState,
     config: &NcConfig,
     ctk_override: Option<String>,
@@ -2102,7 +2144,7 @@ async fn restart_chat_worker(
     *worker_evt_rx = None;
     clear_interrupt_signal(&interrupt_signal);
 
-    let (cmd_tx, evt_rx, hw, max_context_tokens) = start_chat_worker(
+    let (cmd_tx, evt_rx, hw, max_context_tokens, bash_kill) = start_chat_worker(
         config,
         ctk_override,
         ctv_override,
@@ -2114,7 +2156,9 @@ async fn restart_chat_worker(
     *worker_cmd_tx = Some(cmd_tx);
     *worker_evt_rx = Some(evt_rx);
     *telemetry_hw = hw;
+    *bash_kill_signal_out = bash_kill;
     app.max_context_tokens = max_context_tokens;
+    app.running_bash_call_ids.clear();
     app.status = "inicializando modelo...".to_string();
     app.busy = true;
     app.busy_started_at = Some(Instant::now());
@@ -2186,12 +2230,14 @@ pub async fn run_tui(
     let mut rewind_manager = RewindManager::default();
     let interrupt_signal = Arc::new(AtomicBool::new(false));
     let mut telemetry_hw = initial_hw;
+    let mut bash_kill_signal = nanocode_core::tools::bash::new_kill_signal();
 
     if !app.needs_model_setup {
         restart_chat_worker(
             &mut worker_cmd_tx,
             &mut worker_evt_rx,
             &mut telemetry_hw,
+            &mut bash_kill_signal,
             &mut app,
             config,
             ctk_override.clone(),
@@ -2306,6 +2352,7 @@ pub async fn run_tui(
                                     &mut worker_cmd_tx,
                                     &mut worker_evt_rx,
                                     &mut telemetry_hw,
+                                    &mut bash_kill_signal,
                                     &mut app,
                                     config,
                                     ctk_override.clone(),
@@ -2480,6 +2527,7 @@ pub async fn run_tui(
                                                 &mut worker_cmd_tx,
                                                 &mut worker_evt_rx,
                                                 &mut telemetry_hw,
+                                                &mut bash_kill_signal,
                                                 &mut app,
                                                 config,
                                                 ctk_override.clone(),
@@ -2593,6 +2641,7 @@ pub async fn run_tui(
                                 &mut worker_cmd_tx,
                                 &mut worker_evt_rx,
                                 &mut telemetry_hw,
+                                &mut bash_kill_signal,
                                 &mut app,
                                 config,
                                 ctk_override.clone(),
@@ -2610,6 +2659,7 @@ pub async fn run_tui(
                                     &mut worker_cmd_tx,
                                     &mut worker_evt_rx,
                                     &mut telemetry_hw,
+                                    &mut bash_kill_signal,
                                     &mut app,
                                     config,
                                     ctk_override.clone(),
@@ -2646,6 +2696,7 @@ pub async fn run_tui(
                             &mut attachment_engine,
                             worker_cmd_tx.as_ref(),
                             &interrupt_signal,
+                            &bash_kill_signal,
                             &mut tool_index_by_id,
                             &mut rewind_manager,
                         )
@@ -2673,6 +2724,7 @@ pub async fn run_tui(
                                         &mut worker_cmd_tx,
                                         &mut worker_evt_rx,
                                         &mut telemetry_hw,
+                                        &mut bash_kill_signal,
                                         &mut app,
                                         config,
                                         ctk_override.clone(),
@@ -2764,6 +2816,7 @@ pub async fn run_tui(
                                         &mut worker_cmd_tx,
                                         &mut worker_evt_rx,
                                         &mut telemetry_hw,
+                                        &mut bash_kill_signal,
                                         &mut app,
                                         config,
                                         ctk_override.clone(),
@@ -2819,6 +2872,7 @@ pub async fn run_tui(
                                 &mut worker_cmd_tx,
                                 &mut worker_evt_rx,
                                 &mut telemetry_hw,
+                                &mut bash_kill_signal,
                                 &mut app,
                                 config,
                                 ctk_override.clone(),
