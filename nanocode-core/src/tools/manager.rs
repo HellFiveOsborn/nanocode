@@ -1,6 +1,7 @@
 //! Tool manager
 
 use super::base::Tool;
+use super::mcp::{discover_tools, McpProxyTool};
 use crate::config::NcConfig;
 use crate::types::{AvailableTool, InvokeContext, ToolError, ToolOutput, ToolPermission};
 use std::collections::{HashMap, HashSet};
@@ -21,7 +22,7 @@ pub struct ToolConfig {
 }
 
 impl ToolManager {
-    pub fn new(config: &NcConfig) -> Self {
+    pub async fn new(config: &NcConfig) -> Self {
         let mut tools = HashMap::new();
         let mut configs = HashMap::new();
 
@@ -126,11 +127,45 @@ impl ToolManager {
             );
         }
 
-        Self {
+        #[cfg(all(feature = "tool-read", feature = "tool-grep"))]
+        {
+            tools.insert(
+                "task".to_string(),
+                Arc::new(crate::tools::task::TaskTool::new()) as Arc<dyn Tool>,
+            );
+            configs.insert(
+                "task".to_string(),
+                ToolConfig {
+                    permission: ToolPermission::Ask,
+                    allowlist: Vec::new(),
+                    denylist: Vec::new(),
+                },
+            );
+        }
+
+        {
+            tools.insert(
+                "ask_user_question".to_string(),
+                Arc::new(crate::tools::ask_user_question::AskUserQuestionTool::new())
+                    as Arc<dyn Tool>,
+            );
+            configs.insert(
+                "ask_user_question".to_string(),
+                ToolConfig {
+                    permission: ToolPermission::Always,
+                    allowlist: Vec::new(),
+                    denylist: Vec::new(),
+                },
+            );
+        }
+
+        let mut manager = Self {
             tools,
             configs: RwLock::new(configs),
             enabled_tools: RwLock::new(None),
-        }
+        };
+        manager.integrate_mcp(config).await;
+        manager
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
@@ -155,6 +190,10 @@ impl ToolManager {
 
     pub fn has_tool(&self, name: &str) -> bool {
         self.tools.contains_key(name)
+    }
+
+    pub fn list_tool_names(&self) -> Vec<String> {
+        self.tools.keys().cloned().collect()
     }
 
     pub fn available_tools(&self) -> Vec<&dyn Tool> {
@@ -245,5 +284,41 @@ impl ToolManager {
             .as_ref()
             .map(|set| set.contains(tool_name))
             .unwrap_or(true)
+    }
+
+    async fn integrate_mcp(&mut self, config: &NcConfig) {
+        let discovered = discover_tools(config).await;
+        for (server, remote_tool) in discovered {
+            let base_name = server.build_tool_name(&remote_tool.name);
+            let name = self.unique_tool_name(&base_name);
+            let tool = McpProxyTool::from_remote(server, remote_tool, name.clone());
+            self.tools.insert(name.clone(), Arc::new(tool) as Arc<dyn Tool>);
+            self.configs
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(
+                    name,
+                    ToolConfig {
+                        permission: ToolPermission::Ask,
+                        allowlist: Vec::new(),
+                        denylist: Vec::new(),
+                    },
+                );
+        }
+    }
+
+    fn unique_tool_name(&self, base: &str) -> String {
+        if !self.tools.contains_key(base) {
+            return base.to_string();
+        }
+
+        let mut i = 2usize;
+        loop {
+            let candidate = format!("{base}_{i}");
+            if !self.tools.contains_key(&candidate) {
+                return candidate;
+            }
+            i = i.saturating_add(1);
+        }
     }
 }

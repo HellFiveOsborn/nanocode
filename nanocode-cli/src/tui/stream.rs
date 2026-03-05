@@ -46,6 +46,15 @@ fn split_keep_tail_chars(s: &str, tail_chars: usize) -> (&str, &str) {
 }
 
 impl StreamSanitizer {
+    /// Start the sanitizer already inside a `<think>` block.
+    ///
+    /// Use this when the chat template itself emits the opening `<think>` tag
+    /// (e.g. Qwen3/3.5 with `enable_thinking=true`), so the model output begins
+    /// directly with thinking content and only emits `</think>` to close.
+    pub fn start_in_thinking(&mut self) {
+        self.hidden = HiddenStreamState::ThinkTag;
+    }
+
     pub fn is_in_thinking(&self) -> bool {
         matches!(
             self.hidden,

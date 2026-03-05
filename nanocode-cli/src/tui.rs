@@ -1,41 +1,54 @@
 use anyhow::{anyhow, Result};
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use nanocode_core::agents::{AgentPolicy, BuiltinAgent};
 use nanocode_core::config::ToolPermissionConfig;
-use nanocode_core::NcConfig;
+use nanocode_core::interrupt::{clear_interrupt_signal, set_interrupt_signal};
+use nanocode_core::session::load_session_by_id_sync;
+use nanocode_core::skills::SkillManager;
+use nanocode_core::types::{LlmMessage, MessageRole};
+use nanocode_core::{NcConfig, QuestionAnswerSource, UserQuestionResponse};
 use nanocode_hf::{
     default_model, enforce_single_quant_cache, find_any_installed_model_quant, find_model,
-    find_quant_by_name, list_cached_quants, models, recommend, recommend_runtime_limits,
-    DownloadProgress, Downloader, HardwareInfo, ModelSpec,
+    find_quant_by_name, list_cached_quants, model_quantizations, models,
+    preload_dynamic_quantizations, recommend, recommend_runtime_limits, DownloadProgress,
+    Downloader, HardwareInfo, ModelSpec,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+mod attachments;
+mod clipboard;
 mod commands;
 mod render;
+mod rewind;
 mod runtime;
 mod state;
 mod stream;
 mod terminal;
 mod worker;
 
+use attachments::{AttachmentEngine, MentionSuggestion};
+use clipboard::{read_clipboard_payload, ClipboardPayload};
 use commands::{
-    apply_selected_slash_suggestion, handle_local_command, is_exit_command,
-    refresh_slash_suggestions, resolve_slash_prompt_body,
+    apply_selected_slash_suggestion, handle_local_command, is_builtin_command, is_exit_command,
+    refresh_slash_suggestions, resolve_slash_prompt_body, try_build_skill_prompt,
 };
 use render::draw_ui;
+use rewind::RewindManager;
 use runtime::{build_runtime, runtime_snapshot};
 use state::{
-    AppState, ApprovalOption, ChatItem, ConfigField, ConfigFieldKey, ConfigScreenState,
-    DownloadProgressView, InputMode, ModelChoice, ModelSetupState, ModelSetupView, PendingApproval,
-    SetupChoice, ToolState, UiScreen,
+    AgentSwitchRequest, AppState, ApprovalOption, ChatItem, ConfigField, ConfigFieldKey,
+    ConfigScreenState, DownloadProgressView, InputMode, MentionSuggestionEntry, ModelChoice,
+    ModelSetupState, ModelSetupView, PendingApproval, PendingImagePaste, PendingPlanReview,
+    PendingTextPaste, PendingUserQuestion, PlanReviewOption, SessionResumeRequest, SetupChoice,
+    SkillEntry, ToolState, UiScreen,
 };
 use terminal::{restore_terminal, setup_terminal};
 use worker::{spawn_worker, WorkerCommand, WorkerEvent};
@@ -62,30 +75,113 @@ enum ConfigScreenAction {
     SaveAndClose,
 }
 
+fn format_duration_short(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs >= 60 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
+fn agent_status_label(agent: BuiltinAgent) -> &'static str {
+    match agent {
+        BuiltinAgent::Default => "Padrão",
+        BuiltinAgent::Plan => "Plano",
+        BuiltinAgent::Build => "Implementação",
+        BuiltinAgent::Explore => "Explorar",
+    }
+}
+
+fn should_offer_plan_review(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let line_count = trimmed.lines().count();
+    let long_enough = trimmed.chars().count() >= 220 || line_count >= 6;
+    let has_plan_shape = trimmed.lines().any(|line| {
+        let l = line.trim_start();
+        l.starts_with('#')
+            || l.starts_with("- [ ]")
+            || l.starts_with("- [x]")
+            || l.starts_with("- ")
+            || l.starts_with("* ")
+            || l.starts_with("1.")
+            || l.starts_with("2.")
+            || l.starts_with("|")
+    });
+
+    long_enough && has_plan_shape
+}
+
+fn build_plan_bootstrap_prompt(plan_text: &str) -> Option<String> {
+    let trimmed = plan_text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "Plano aprovado para execução no modo implementação.\n\
+\n\
+Use exclusivamente o plano abaixo como contexto inicial.\n\
+\n\
+{}\n\
+\n\
+Implemente este plano de forma sequencial.",
+        trimmed
+    ))
+}
+
 fn apply_worker_event(
     app: &mut AppState,
     evt: WorkerEvent,
     tool_index_by_id: &mut HashMap<String, usize>,
+    rewind_manager: &mut RewindManager,
 ) {
     match evt {
-        WorkerEvent::Ready { model_label } => {
+        WorkerEvent::SessionReady {
+            session_id,
+            resumed,
+        } => {
+            app.current_session_id = Some(session_id.clone());
+            if let Err(err) = rewind_manager.set_session(&session_id) {
+                app.chat.push(ChatItem::Error(format!(
+                    "Falha ao inicializar armazenamento de rewind: {err}"
+                )));
+            }
+            if resumed {
+                app.status = format!("sessão retomada: {}", short_session_id(&session_id));
+            }
+        }
+        WorkerEvent::Ready {
+            model_label,
+            supports_thinking,
+            supports_vision,
+        } => {
             app.model_label = model_label;
+            app.supports_thinking = supports_thinking;
+            app.supports_vision = supports_vision;
+            app.thinking_collapsed = !supports_thinking;
             app.busy = false;
             app.busy_started_at = None;
-            app.status = format!("ready · agent {}", app.active_agent.as_str());
+            app.status = format!("pronto · agente {}", agent_status_label(app.active_agent));
         }
         WorkerEvent::Busy(v) => {
             app.busy = v;
             if v {
-                app.status = "thinking".to_string();
+                app.status = "pensando".to_string();
                 app.busy_started_at = Some(Instant::now());
                 app.thinking_idx = None;
                 app.stream_idx = None;
+                app.pending_plan_review = None;
             } else {
-                app.status = format!("ready · agent {}", app.active_agent.as_str());
+                app.status = format!("pronto · agente {}", agent_status_label(app.active_agent));
                 app.busy_started_at = None;
                 app.stream_idx = None;
                 app.pending_approval = None;
+                app.pending_user_question = None;
                 if let Some(idx) = app.thinking_idx {
                     if let Some(ChatItem::Thinking { active, .. }) = app.chat.get_mut(idx) {
                         *active = false;
@@ -95,7 +191,7 @@ fn apply_worker_event(
             }
         }
         WorkerEvent::Interrupted => {
-            app.status = "interrupted".to_string();
+            app.status = "interrompido".to_string();
         }
         WorkerEvent::ThinkingActive(active) => {
             if active {
@@ -141,68 +237,180 @@ fn apply_worker_event(
                 }
             }
         }
-        WorkerEvent::AssistantDone(final_text) => {
-            if let Some(idx) = app.stream_idx {
-                if let Some(ChatItem::Assistant(text)) = app.chat.get_mut(idx) {
-                    if !final_text.trim().is_empty() {
-                        *text = final_text;
+        WorkerEvent::AssistantChunk(chunk) => {
+            if app.stream_idx.is_none() {
+                // Close any active thinking block before starting assistant stream
+                if let Some(idx) = app.thinking_idx {
+                    if let Some(ChatItem::Thinking { active, .. }) = app.chat.get_mut(idx) {
+                        *active = false;
                     }
                 }
-            } else if !final_text.trim().is_empty() {
-                app.chat.push(ChatItem::Assistant(final_text));
+                app.chat.push(ChatItem::Assistant(String::new()));
+                app.stream_idx = Some(app.chat.len() - 1);
+            }
+            if let Some(idx) = app.stream_idx {
+                if let Some(ChatItem::Assistant(text)) = app.chat.get_mut(idx) {
+                    text.push_str(&chunk);
+                }
             }
         }
-        WorkerEvent::ToolCall { call_id, summary } => {
+        WorkerEvent::AssistantDone(final_text) => {
+            let has_text = !final_text.trim().is_empty();
+            let should_offer_review = app.active_agent == BuiltinAgent::Plan
+                && app.pending_approval.is_none()
+                && should_offer_plan_review(&final_text);
+
+            if let Some(idx) = app.stream_idx {
+                if let Some(ChatItem::Assistant(text)) = app.chat.get_mut(idx) {
+                    if has_text {
+                        *text = final_text.clone();
+                    }
+                }
+            } else if has_text {
+                app.chat.push(ChatItem::Assistant(final_text.clone()));
+            }
+
+            if should_offer_review {
+                app.pending_plan_review = Some(PendingPlanReview {
+                    selected_option: PlanReviewOption::ApproveAndBuild,
+                    plan_text: final_text,
+                });
+                app.status = "Plano pronto: aprove, reprove ou peça ajustes.".to_string();
+            }
+        }
+        WorkerEvent::ToolCall {
+            call_id,
+            tool_name,
+            summary,
+        } => {
             if let Some(idx) = app.thinking_idx {
                 if let Some(ChatItem::Thinking { active, .. }) = app.chat.get_mut(idx) {
                     *active = false;
                 }
             }
             app.thinking_idx = None;
+            app.stream_idx = None;
+            let subagent = if tool_name == "task" {
+                Some(state::SubagentTracking {
+                    started_at: Some(Instant::now()),
+                    ..Default::default()
+                })
+            } else {
+                None
+            };
             app.chat.push(ChatItem::Tool {
+                tool_name,
                 summary,
-                stream: Some("running".to_string()),
-                detail: None,
+                stream: Some("executando".to_string()),
+                output: None,
+                code_path: None,
+                code: None,
+                diff: None,
                 state: ToolState::Running,
+                subagent,
             });
             tool_index_by_id.insert(call_id, app.chat.len() - 1);
         }
         WorkerEvent::ApprovalRequired {
             call_id,
             summary,
-            arguments,
+            details,
+            diff_preview,
             decision_tx,
         } => {
-            app.status = "awaiting approval".to_string();
+            if let Some(idx) = tool_index_by_id.get(&call_id).copied() {
+                if let Some(ChatItem::Tool { stream, .. }) = app.chat.get_mut(idx) {
+                    *stream = Some("Aguardando aprovação".to_string());
+                }
+            }
+            app.status = "Aguardando aprovação".to_string();
             app.pending_approval = Some(PendingApproval {
-                call_id,
                 summary,
-                arguments,
+                details,
+                diff_preview,
                 decision_tx,
                 selected_option: ApprovalOption::ApproveOnce,
+            });
+        }
+        WorkerEvent::QuestionRequired {
+            call_id,
+            question,
+            choices,
+            allow_free_text,
+            placeholder,
+            response_tx,
+        } => {
+            if let Some(idx) = tool_index_by_id.get(&call_id).copied() {
+                if let Some(ChatItem::Tool { stream, .. }) = app.chat.get_mut(idx) {
+                    *stream = Some("Aguardando resposta do usuário".to_string());
+                }
+            }
+            app.status = "Aguardando resposta do usuário".to_string();
+            app.pending_user_question = Some(PendingUserQuestion {
+                question,
+                choices,
+                allow_free_text,
+                placeholder,
+                selected_choice: 0,
+                text_input: String::new(),
+                response_tx,
             });
         }
         WorkerEvent::ToolResult {
             call_id,
             success,
             status_line,
-            result,
+            output,
+            code_path,
+            code,
+            diff,
+            rewind_changes,
         } => {
             if let Some(idx) = tool_index_by_id.get(&call_id).copied() {
                 if let Some(ChatItem::Tool {
+                    tool_name,
                     stream,
-                    detail,
+                    output: existing_output,
+                    code_path: existing_path,
+                    code: existing_code,
+                    diff: existing_diff,
                     state,
+                    subagent,
                     ..
                 }) = app.chat.get_mut(idx)
                 {
                     *stream = status_line;
-                    *detail = Some(result);
+                    *existing_output = output;
+                    *existing_path = code_path;
+                    *existing_code = code;
+                    *existing_diff = diff;
                     *state = if success {
                         ToolState::Ok
                     } else {
                         ToolState::Error
                     };
+                    // Finalize subagent tracking with elapsed time
+                    if tool_name == "task" {
+                        if let Some(ref mut tracking) = subagent {
+                            let elapsed =
+                                tracking.started_at.map(|s| s.elapsed()).unwrap_or_default();
+                            tracking.final_tools_called = Some(tracking.tools_done);
+                            // Encode elapsed in stream for rendering
+                            let tools = tracking.tools_done;
+                            let elapsed_str = format_duration_short(elapsed);
+                            if let Some(s) = stream {
+                                *s = format!("{} · {}", s, elapsed_str);
+                            }
+                            let _ = (tools, elapsed_str);
+                        }
+                    }
+                }
+            }
+            if !rewind_changes.is_empty() {
+                if let Err(err) = rewind_manager.record_change_set(rewind_changes) {
+                    app.chat.push(ChatItem::Error(format!(
+                        "Falha ao salvar snapshot de rewind: {err}"
+                    )));
                 }
             }
         }
@@ -210,9 +418,9 @@ fn apply_worker_event(
             old_context_tokens,
             threshold,
         } => {
-            app.status = "auto-compacting context".to_string();
+            app.status = "compactando contexto automaticamente".to_string();
             app.chat.push(ChatItem::Assistant(format!(
-                "[compact] Triggered at {} tokens (threshold {}).",
+                "[compact] Disparado com {} tokens (limite {}).",
                 old_context_tokens, threshold
             )));
         }
@@ -222,15 +430,51 @@ fn apply_worker_event(
             summary_len,
         } => {
             app.chat.push(ChatItem::Assistant(format!(
-                "[compact] Completed: {} -> {} tokens (summary {} chars).",
+                "[compact] Concluído: {} -> {} tokens (resumo com {} caracteres).",
                 old_context_tokens, new_context_tokens, summary_len
             )));
-            app.status = format!("ready · agent {}", app.active_agent.as_str());
+            app.status = format!("pronto · agente {}", agent_status_label(app.active_agent));
         }
         WorkerEvent::StoppedByMiddleware { reason } => {
-            app.status = "stopped by middleware".to_string();
-            app.chat
-                .push(ChatItem::Error(format!("Middleware stop: {}", reason)));
+            app.status = "interrompido por middleware".to_string();
+            app.chat.push(ChatItem::Error(format!(
+                "Interrupção do middleware: {}",
+                reason
+            )));
+        }
+        WorkerEvent::SubagentToolCall {
+            parent_call_id,
+            summary,
+        } => {
+            if let Some(idx) = tool_index_by_id.get(&parent_call_id).copied() {
+                if let Some(ChatItem::Tool {
+                    subagent: Some(ref mut tracking),
+                    stream,
+                    ..
+                }) = app.chat.get_mut(idx)
+                {
+                    tracking.sub_tools.push(state::SubToolEntry {
+                        summary: summary.clone(),
+                        done: false,
+                    });
+                    *stream = Some(format!("Executando…{}", summary));
+                }
+            }
+        }
+        WorkerEvent::SubagentToolResult { parent_call_id } => {
+            if let Some(idx) = tool_index_by_id.get(&parent_call_id).copied() {
+                if let Some(ChatItem::Tool {
+                    subagent: Some(ref mut tracking),
+                    ..
+                }) = app.chat.get_mut(idx)
+                {
+                    tracking.tools_done += 1;
+                    // Mark the latest sub-tool as done
+                    if let Some(last) = tracking.sub_tools.last_mut() {
+                        last.done = true;
+                    }
+                }
+            }
         }
         WorkerEvent::Stats(stats) => {
             app.stats = stats;
@@ -241,11 +485,240 @@ fn apply_worker_event(
     }
 }
 
+fn refresh_skill_catalog(app: &mut AppState, config: &NcConfig) {
+    let manager = SkillManager::new(config);
+    app.skills = manager
+        .available_skills()
+        .into_iter()
+        .map(|(name, info)| {
+            (
+                name.clone(),
+                SkillEntry {
+                    name,
+                    description: info.description,
+                    skill_path: info.skill_path.display().to_string(),
+                    user_invocable: info.user_invocable,
+                },
+            )
+        })
+        .collect();
+    app.skills_count = app.skills.len();
+}
+
+const PASTE_SUMMARY_MIN_LINES: usize = 8;
+const PASTE_SUMMARY_MIN_CHARS: usize = 320;
+
+fn clear_mention_suggestions(app: &mut AppState) {
+    app.mention_suggestions.clear();
+    app.mention_selected = 0;
+    app.mention_replace_range = None;
+}
+
+fn refresh_input_suggestions(app: &mut AppState, attachment_engine: &mut AttachmentEngine) {
+    refresh_slash_suggestions(app);
+    if app.input_mode == InputMode::Slash {
+        clear_mention_suggestions(app);
+        return;
+    }
+
+    let completion = attachment_engine.complete_for_input(&app.input);
+    let suggestions = completion
+        .suggestions
+        .into_iter()
+        .map(|s: MentionSuggestion| MentionSuggestionEntry {
+            replacement: s.replacement,
+            display: s.display,
+            description: s.description,
+            is_directory: s.is_directory,
+        })
+        .collect::<Vec<_>>();
+
+    app.mention_replace_range = completion.replace_range;
+    app.mention_suggestions = suggestions;
+    if app.mention_suggestions.is_empty() {
+        app.mention_selected = 0;
+    } else if app.mention_selected >= app.mention_suggestions.len() {
+        app.mention_selected = 0;
+    }
+}
+
+fn apply_selected_mention_suggestion(app: &mut AppState) -> bool {
+    let Some((start, end)) = app.mention_replace_range else {
+        return false;
+    };
+    let Some(selected) = app.mention_suggestions.get(app.mention_selected) else {
+        return false;
+    };
+    if start >= end || end > app.input.len() {
+        return false;
+    }
+
+    let mut new_input = String::with_capacity(app.input.len() + selected.replacement.len());
+    new_input.push_str(&app.input[..start]);
+    new_input.push_str(&selected.replacement);
+    new_input.push_str(&app.input[end..]);
+    app.input = new_input;
+    true
+}
+
+fn clear_pending_pastes(app: &mut AppState) {
+    app.pending_text_pastes.clear();
+    app.pending_image_pastes.clear();
+}
+
+fn prune_detached_placeholders(app: &mut AppState) {
+    app.pending_text_pastes
+        .retain(|p| app.input.contains(&p.token));
+    app.pending_image_pastes
+        .retain(|p| app.input.contains(&p.token));
+}
+
+fn normalize_paste_text(raw: &str) -> String {
+    raw.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn should_summarize_paste(text: &str) -> bool {
+    text.chars().count() >= PASTE_SUMMARY_MIN_CHARS
+        || text.lines().count() >= PASTE_SUMMARY_MIN_LINES
+}
+
+fn apply_text_paste(app: &mut AppState, raw: &str, attachment_engine: &mut AttachmentEngine) {
+    let normalized = normalize_paste_text(raw);
+    if normalized.is_empty() {
+        return;
+    }
+
+    if should_summarize_paste(&normalized) {
+        let line_count = normalized.lines().count().max(1);
+        app.paste_sequence = app.paste_sequence.saturating_add(1);
+        let token = format!("[Colado ~{} linhas #{}]", line_count, app.paste_sequence);
+        app.pending_text_pastes.push(PendingTextPaste {
+            token: token.clone(),
+            full_text: normalized,
+        });
+        app.input.push_str(&token);
+        app.status = format!("paste resumido ({} linhas)", line_count);
+    } else {
+        app.input.push_str(&normalized);
+        app.status = "texto colado".to_string();
+    }
+
+    prune_detached_placeholders(app);
+    refresh_input_suggestions(app, attachment_engine);
+}
+
+fn apply_image_paste_data_url(
+    app: &mut AppState,
+    data_url: String,
+    attachment_engine: &mut AttachmentEngine,
+) {
+    if !app.supports_vision {
+        app.status = "modelo atual não suporta visão; imagem ignorada".to_string();
+        return;
+    }
+
+    app.paste_sequence = app.paste_sequence.saturating_add(1);
+    let token = format!("[Imagem {}]", app.paste_sequence);
+    app.pending_image_pastes.push(PendingImagePaste {
+        token: token.clone(),
+        data_url,
+    });
+    app.input.push_str(&token);
+    app.status = "imagem colada do clipboard".to_string();
+    refresh_input_suggestions(app, attachment_engine);
+}
+
+fn apply_clipboard_shortcut_paste(app: &mut AppState, attachment_engine: &mut AttachmentEngine) {
+    match read_clipboard_payload() {
+        Ok(ClipboardPayload::ImageDataUrl(data_url)) => {
+            apply_image_paste_data_url(app, data_url, attachment_engine)
+        }
+        Ok(ClipboardPayload::Text(text)) => apply_text_paste(app, &text, attachment_engine),
+        Err(err) => {
+            app.status = format!("falha ao colar do clipboard: {err}");
+        }
+    }
+}
+
+fn expand_prompt_with_pastes(prompt: String, app: &AppState) -> String {
+    let mut expanded = prompt;
+    for pending in &app.pending_text_pastes {
+        expanded = expanded.replace(&pending.token, &pending.full_text);
+    }
+    expanded
+}
+
+fn collect_pending_image_payloads(app: &AppState) -> Vec<String> {
+    app.pending_image_pastes
+        .iter()
+        .filter(|pending| app.input.contains(&pending.token))
+        .map(|pending| pending.data_url.clone())
+        .collect()
+}
+
+fn short_session_id(session_id: &str) -> &str {
+    let max = 12usize;
+    if session_id.len() > max {
+        &session_id[..max]
+    } else {
+        session_id
+    }
+}
+
+fn restore_chat_from_session_messages(
+    app: &mut AppState,
+    loaded_messages: &[LlmMessage],
+    session_id: &str,
+) {
+    app.chat.clear();
+    app.chat.push(ChatItem::Banner);
+
+    for msg in loaded_messages {
+        match msg.role {
+            MessageRole::User => {
+                let text = msg.content.to_plain_text_lossy();
+                if !text.trim().is_empty() {
+                    app.chat.push(ChatItem::User(text));
+                }
+            }
+            MessageRole::Assistant => {
+                if msg.tool_calls.is_some() && msg.content.to_plain_text_lossy().trim().is_empty() {
+                    continue;
+                }
+                let text = msg.content.to_plain_text_lossy();
+                if !text.trim().is_empty() {
+                    app.chat.push(ChatItem::Assistant(text));
+                }
+            }
+            MessageRole::System | MessageRole::Tool => {}
+        }
+    }
+
+    if app.chat.len() == 1 {
+        app.chat.push(ChatItem::Assistant(
+            "Sessão carregada. Nenhuma mensagem visível ao usuário foi encontrada.".to_string(),
+        ));
+    }
+
+    app.chat.push(ChatItem::Assistant(format!(
+        "Sessão `{}` retomada.",
+        short_session_id(session_id)
+    )));
+    app.status = format!("sessão retomada: {}", short_session_id(session_id));
+    app.chat_scroll = 0;
+    app.stream_idx = None;
+    app.thinking_idx = None;
+}
+
 async fn submit_prompt(
     app: &mut AppState,
+    attachment_engine: &mut AttachmentEngine,
     cmd_tx: &mpsc::Sender<WorkerCommand>,
     tool_index_by_id: &mut HashMap<String, usize>,
+    rewind_manager: &mut RewindManager,
 ) -> bool {
+    prune_detached_placeholders(app);
+
     let mut prompt_body = app.input.trim().to_string();
     if app.input_mode == InputMode::Slash {
         prompt_body = resolve_slash_prompt_body(app, &prompt_body);
@@ -260,32 +733,109 @@ async fn submit_prompt(
         InputMode::Slash => format!("/{}", prompt_body),
     };
     let was_slash = app.input_mode == InputMode::Slash;
+    let prompt_for_model = if was_slash {
+        String::new()
+    } else {
+        expand_prompt_with_pastes(prompt.clone(), app)
+    };
+    let image_payloads = if was_slash {
+        Vec::new()
+    } else {
+        collect_pending_image_payloads(app)
+    };
 
     app.input_mode = InputMode::Default;
     app.input.clear();
-    app.thinking_collapsed = true;
-    refresh_slash_suggestions(app);
+    clear_pending_pastes(app);
+    app.thinking_collapsed = !app.supports_thinking;
+    clear_mention_suggestions(app);
+    refresh_input_suggestions(app, attachment_engine);
 
     app.chat.push(ChatItem::User(prompt.clone()));
 
     if was_slash {
-        return handle_local_command(app, &prompt, tool_index_by_id);
+        if is_builtin_command(&prompt) {
+            return handle_local_command(app, &prompt, tool_index_by_id, rewind_manager);
+        }
+
+        match try_build_skill_prompt(app, &prompt) {
+            Ok(Some(invocation)) => {
+                app.status = format!("skill `{}` carregada", invocation.skill_name);
+                let _ = cmd_tx
+                    .send(WorkerCommand::Submit {
+                        prompt: invocation.model_prompt,
+                        image_data_urls: Vec::new(),
+                    })
+                    .await;
+            }
+            Ok(None) => {
+                app.chat.push(ChatItem::Error(format!(
+                    "Comando desconhecido: {}. Digite /help.",
+                    prompt.trim()
+                )));
+            }
+            Err(err) => {
+                app.chat.push(ChatItem::Error(err));
+            }
+        }
+        return false;
     }
 
     if is_exit_command(&prompt) {
         return true;
     }
 
-    let _ = cmd_tx.send(WorkerCommand::Submit(prompt)).await;
+    let expansion = attachment_engine.expand_prompt(prompt_for_model);
+    for line in expansion.status_lines {
+        app.chat.push(ChatItem::Assistant(line));
+    }
+    for err in expansion.errors {
+        app.chat.push(ChatItem::Error(err));
+    }
+    let prompt_for_model = expansion.prompt_for_model;
+    let mut image_data_urls = image_payloads;
+    image_data_urls.extend(expansion.image_data_urls);
+    if !image_data_urls.is_empty() && !app.supports_vision {
+        app.chat.push(ChatItem::Error(
+            "Este modelo não suporta visão. Remova os anexos de imagem ou troque o modelo."
+                .to_string(),
+        ));
+        app.status = "envio bloqueado: modelo sem visão".to_string();
+        return false;
+    }
+
+    let _ = cmd_tx
+        .send(WorkerCommand::Submit {
+            prompt: prompt_for_model,
+            image_data_urls,
+        })
+        .await;
     false
+}
+
+fn queue_agent_cycle(app: &mut AppState, reverse: bool) {
+    let next_agent = app.active_agent.cycle_primary(reverse);
+    if next_agent == app.active_agent {
+        return;
+    }
+    if next_agent == BuiltinAgent::Plan {
+        app.yolo_mode = false;
+    }
+    app.requested_agent_switch = Some(AgentSwitchRequest {
+        target: next_agent,
+        bootstrap_prompt: None,
+    });
+    app.status = format!("alternando agente -> {}", agent_status_label(next_agent));
 }
 
 async fn handle_key_event(
     key: KeyEvent,
     app: &mut AppState,
+    attachment_engine: &mut AttachmentEngine,
     cmd_tx: Option<&mpsc::Sender<WorkerCommand>>,
     interrupt_signal: &Arc<AtomicBool>,
     tool_index_by_id: &mut HashMap<String, usize>,
+    rewind_manager: &mut RewindManager,
 ) -> bool {
     if key.kind != KeyEventKind::Press {
         return false;
@@ -305,12 +855,44 @@ async fn handle_key_event(
             (KeyCode::Char('3'), _)
             | (KeyCode::Char('n'), KeyModifiers::NONE | KeyModifiers::SHIFT)
             | (KeyCode::Esc, _) => Some(ApprovalOption::Deny.to_decision()),
-            (KeyCode::Left, _) | (KeyCode::Up, _) => {
+            (KeyCode::Up, KeyModifiers::NONE) => {
                 pending.selected_option = pending.selected_option.prev();
                 None
             }
-            (KeyCode::Right, _) | (KeyCode::Down, _) | (KeyCode::Tab, _) => {
+            (KeyCode::Down, KeyModifiers::NONE) => {
                 pending.selected_option = pending.selected_option.next();
+                None
+            }
+            (KeyCode::Left, _) => {
+                pending.selected_option = pending.selected_option.prev();
+                None
+            }
+            (KeyCode::Right, _) | (KeyCode::Tab, _) => {
+                pending.selected_option = pending.selected_option.next();
+                None
+            }
+            (KeyCode::PageUp, _) => {
+                app.chat_scroll = app.chat_scroll.saturating_add(5);
+                None
+            }
+            (KeyCode::PageDown, _) => {
+                app.chat_scroll = app.chat_scroll.saturating_sub(5);
+                None
+            }
+            (KeyCode::Home, _) => {
+                app.chat_scroll = u16::MAX;
+                None
+            }
+            (KeyCode::End, _) => {
+                app.chat_scroll = 0;
+                None
+            }
+            (KeyCode::Up, KeyModifiers::SHIFT) | (KeyCode::Up, KeyModifiers::CONTROL) => {
+                app.chat_scroll = app.chat_scroll.saturating_add(5);
+                None
+            }
+            (KeyCode::Down, KeyModifiers::SHIFT) | (KeyCode::Down, KeyModifiers::CONTROL) => {
+                app.chat_scroll = app.chat_scroll.saturating_sub(5);
                 None
             }
             (KeyCode::Enter, _) => Some(pending.selected_option.to_decision()),
@@ -321,14 +903,267 @@ async fn handle_key_event(
             let _ = pending.decision_tx.send(decision);
             app.status = match decision {
                 nanocode_core::ApprovalDecision::ApproveAlwaysToolSession => {
-                    "running tool (tool set to always for this session)".to_string()
+                    "executando ferramenta (sempre nesta sessão)".to_string()
                 }
-                nanocode_core::ApprovalDecision::ApproveOnce => "running tool".to_string(),
-                nanocode_core::ApprovalDecision::Deny => "tool denied".to_string(),
+                nanocode_core::ApprovalDecision::ApproveOnce => "executando ferramenta".to_string(),
+                nanocode_core::ApprovalDecision::Deny => "ferramenta negada".to_string(),
             };
         } else {
             app.pending_approval = Some(pending);
         }
+        return false;
+    }
+
+    if let Some(pending) = app.pending_user_question.take() {
+        let mut pending = pending;
+        let mut response: Option<UserQuestionResponse> = None;
+
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => {
+                response = Some(UserQuestionResponse::cancelled());
+            }
+            (KeyCode::Char(ch), KeyModifiers::NONE)
+                if ('1'..='9').contains(&ch) && !pending.choices.is_empty() =>
+            {
+                let idx = (ch as u8 - b'1') as usize;
+                if idx < pending.choices.len() {
+                    pending.selected_choice = idx;
+                }
+            }
+            (KeyCode::Up, KeyModifiers::NONE) if !pending.choices.is_empty() => {
+                let count = pending.choices.len();
+                pending.selected_choice = (pending.selected_choice + count - 1) % count;
+            }
+            (KeyCode::Down, KeyModifiers::NONE) if !pending.choices.is_empty() => {
+                let count = pending.choices.len();
+                pending.selected_choice = (pending.selected_choice + 1) % count;
+            }
+            (KeyCode::Backspace, _) if pending.allow_free_text => {
+                pending.text_input.pop();
+            }
+            (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT)
+                if pending.allow_free_text =>
+            {
+                pending.text_input.push(ch);
+            }
+            (KeyCode::Enter, _) => {
+                let typed = pending.text_input.trim().to_string();
+                if pending.allow_free_text && !typed.is_empty() {
+                    response = Some(UserQuestionResponse {
+                        answer: typed,
+                        choice_index: None,
+                        source: QuestionAnswerSource::Text,
+                        cancelled: false,
+                    });
+                } else if let Some(choice) = pending.choices.get(pending.selected_choice) {
+                    response = Some(UserQuestionResponse {
+                        answer: choice.clone(),
+                        choice_index: Some(pending.selected_choice),
+                        source: QuestionAnswerSource::Choice,
+                        cancelled: false,
+                    });
+                } else if pending.allow_free_text {
+                    response = Some(UserQuestionResponse {
+                        answer: typed,
+                        choice_index: None,
+                        source: QuestionAnswerSource::Text,
+                        cancelled: false,
+                    });
+                } else {
+                    response = Some(UserQuestionResponse::cancelled());
+                }
+            }
+            (KeyCode::PageUp, _) => {
+                app.chat_scroll = app.chat_scroll.saturating_add(5);
+            }
+            (KeyCode::PageDown, _) => {
+                app.chat_scroll = app.chat_scroll.saturating_sub(5);
+            }
+            (KeyCode::Home, _) => {
+                app.chat_scroll = u16::MAX;
+            }
+            (KeyCode::End, _) => {
+                app.chat_scroll = 0;
+            }
+            (KeyCode::Up, KeyModifiers::SHIFT) | (KeyCode::Up, KeyModifiers::CONTROL) => {
+                app.chat_scroll = app.chat_scroll.saturating_add(5);
+            }
+            (KeyCode::Down, KeyModifiers::SHIFT) | (KeyCode::Down, KeyModifiers::CONTROL) => {
+                app.chat_scroll = app.chat_scroll.saturating_sub(5);
+            }
+            _ => {}
+        }
+
+        if let Some(answer) = response {
+            let _ = pending.response_tx.send(answer.clone());
+            app.status = if answer.cancelled {
+                "pergunta cancelada".to_string()
+            } else {
+                "resposta enviada".to_string()
+            };
+        } else {
+            app.pending_user_question = Some(pending);
+        }
+        return false;
+    }
+
+    if let Some(pending) = app.pending_plan_review.take() {
+        let mut pending = pending;
+        let decision = match (key.code, key.modifiers) {
+            (KeyCode::Char('1'), _)
+            | (KeyCode::Char('y'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                Some(PlanReviewOption::ApproveAndBuild)
+            }
+            (KeyCode::Char('2'), _)
+            | (KeyCode::Char('n'), KeyModifiers::NONE | KeyModifiers::SHIFT)
+            | (KeyCode::Esc, _) => Some(PlanReviewOption::Disapprove),
+            (KeyCode::Char('3'), _)
+            | (KeyCode::Char('r'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                Some(PlanReviewOption::ReworkWithSuggestion)
+            }
+            (KeyCode::Up, KeyModifiers::NONE) => {
+                pending.selected_option = pending.selected_option.prev();
+                None
+            }
+            (KeyCode::Down, KeyModifiers::NONE) => {
+                pending.selected_option = pending.selected_option.next();
+                None
+            }
+            (KeyCode::Left, _) | (KeyCode::BackTab, _) => {
+                pending.selected_option = pending.selected_option.prev();
+                None
+            }
+            (KeyCode::Right, _) => {
+                pending.selected_option = pending.selected_option.next();
+                None
+            }
+            (KeyCode::Tab, KeyModifiers::NONE) => {
+                if pending.selected_option == PlanReviewOption::ReworkWithSuggestion {
+                    Some(PlanReviewOption::ReworkWithSuggestion)
+                } else {
+                    pending.selected_option = pending.selected_option.next();
+                    None
+                }
+            }
+            (KeyCode::Tab, KeyModifiers::SHIFT) => {
+                pending.selected_option = pending.selected_option.prev();
+                None
+            }
+            (KeyCode::PageUp, _) => {
+                app.chat_scroll = app.chat_scroll.saturating_add(5);
+                None
+            }
+            (KeyCode::PageDown, _) => {
+                app.chat_scroll = app.chat_scroll.saturating_sub(5);
+                None
+            }
+            (KeyCode::Home, _) => {
+                app.chat_scroll = u16::MAX;
+                None
+            }
+            (KeyCode::End, _) => {
+                app.chat_scroll = 0;
+                None
+            }
+            (KeyCode::Up, KeyModifiers::SHIFT) | (KeyCode::Up, KeyModifiers::CONTROL) => {
+                app.chat_scroll = app.chat_scroll.saturating_add(5);
+                None
+            }
+            (KeyCode::Down, KeyModifiers::SHIFT) | (KeyCode::Down, KeyModifiers::CONTROL) => {
+                app.chat_scroll = app.chat_scroll.saturating_sub(5);
+                None
+            }
+            (KeyCode::Enter, _) => Some(pending.selected_option),
+            _ => None,
+        };
+
+        if let Some(decision) = decision {
+            match decision {
+                PlanReviewOption::ApproveAndBuild => {
+                    app.chat.push(ChatItem::Assistant(
+                        "Plano aprovado. Mudando para modo implementação com contexto limpo do plano."
+                            .to_string(),
+                    ));
+                    app.requested_agent_switch = Some(AgentSwitchRequest {
+                        target: BuiltinAgent::Build,
+                        bootstrap_prompt: build_plan_bootstrap_prompt(&pending.plan_text),
+                    });
+                    app.status = "Plano aprovado. Alternando para implementação.".to_string();
+                }
+                PlanReviewOption::Disapprove => {
+                    app.chat.push(ChatItem::Assistant(
+                        "Plano reprovado. Envie os ajustes desejados para gerar um novo plano."
+                            .to_string(),
+                    ));
+                    app.status = "Plano reprovado.".to_string();
+                }
+                PlanReviewOption::ReworkWithSuggestion => {
+                    if app.input.trim().is_empty() {
+                        app.input =
+                            "Refaça o plano considerando os seguintes ajustes: ".to_string();
+                    }
+                    app.chat.push(ChatItem::Assistant(
+                        "Digite os ajustes no input e pressione Enter para refazer o plano."
+                            .to_string(),
+                    ));
+                    app.status =
+                        "Digite sua resposta e pressione Enter para continuar.".to_string();
+                }
+            }
+        } else {
+            app.pending_plan_review = Some(pending);
+        }
+        return false;
+    }
+
+    if let Some(pending) = app.pending_resume_selection.take() {
+        let mut pending = pending;
+        let mut selected_session: Option<String> = None;
+        let mut cancelled = false;
+
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _)
+            | (KeyCode::Char('c'), KeyModifiers::CONTROL)
+            | (KeyCode::Char('q'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                cancelled = true;
+                app.status = "retomada cancelada".to_string();
+            }
+            (KeyCode::Up, KeyModifiers::NONE) => {
+                if !pending.sessions.is_empty() {
+                    let count = pending.sessions.len();
+                    pending.selected_idx = (pending.selected_idx + count - 1) % count;
+                }
+            }
+            (KeyCode::Down, KeyModifiers::NONE) => {
+                if !pending.sessions.is_empty() {
+                    let count = pending.sessions.len();
+                    pending.selected_idx = (pending.selected_idx + 1) % count;
+                }
+            }
+            (KeyCode::Enter, _) => {
+                if let Some(session) = pending.sessions.get(pending.selected_idx) {
+                    selected_session = Some(session.id.clone());
+                }
+            }
+            _ => {}
+        }
+
+        if let Some(session_id) = selected_session {
+            app.requested_resume_session = Some(SessionResumeRequest {
+                session_id_query: session_id.clone(),
+            });
+            app.status = format!("retomando sessão {}", short_session_id(&session_id));
+        } else if !cancelled {
+            app.pending_resume_selection = Some(pending);
+        }
+        return false;
+    }
+
+    if !app.busy
+        && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        apply_clipboard_shortcut_paste(app, attachment_engine);
         return false;
     }
 
@@ -338,8 +1173,9 @@ async fn handle_key_event(
                 return true;
             }
             app.input.clear();
+            clear_pending_pastes(app);
             app.input_mode = InputMode::Default;
-            refresh_slash_suggestions(app);
+            refresh_input_suggestions(app, attachment_engine);
         }
         (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
             return true;
@@ -352,14 +1188,29 @@ async fn handle_key_event(
             };
         }
         _ if app.screen == UiScreen::Welcome => {}
-        (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
-            if app.busy && app.thinking_idx.is_some() {
-                app.thinking_collapsed = !app.thinking_collapsed;
-            } else if app.input_mode == InputMode::Slash {
-                app.slash_details_expanded = !app.slash_details_expanded;
+        (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+            app.tools_collapsed = !app.tools_collapsed;
+            app.status = if app.tools_collapsed {
+                "saída de ferramenta oculta (Ctrl+R para mostrar)".to_string()
             } else {
-                app.tools_collapsed = !app.tools_collapsed;
-            }
+                "saída de ferramenta visível (Ctrl+R para ocultar)".to_string()
+            };
+        }
+        (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
+            app.code_blocks_collapsed = !app.code_blocks_collapsed;
+            app.status = if app.code_blocks_collapsed {
+                "código/diff oculto (Ctrl+O para mostrar)".to_string()
+            } else {
+                "código/diff visível (Ctrl+O para ocultar)".to_string()
+            };
+        }
+        (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+            app.thinking_collapsed = !app.thinking_collapsed;
+            app.status = if app.thinking_collapsed {
+                "raciocínio oculto (Ctrl+T para mostrar)".to_string()
+            } else {
+                "raciocínio visível (Ctrl+T para ocultar)".to_string()
+            };
         }
         (KeyCode::PageUp, _) => {
             app.chat_scroll = app.chat_scroll.saturating_add(5);
@@ -367,22 +1218,56 @@ async fn handle_key_event(
         (KeyCode::PageDown, _) => {
             app.chat_scroll = app.chat_scroll.saturating_sub(5);
         }
+        (KeyCode::Home, _) => {
+            app.chat_scroll = u16::MAX;
+        }
+        (KeyCode::End, _) => {
+            app.chat_scroll = 0;
+        }
         (KeyCode::Up, KeyModifiers::SHIFT) => {
             app.chat_scroll = app.chat_scroll.saturating_add(5);
         }
         (KeyCode::Down, KeyModifiers::SHIFT) => {
             app.chat_scroll = app.chat_scroll.saturating_sub(5);
         }
+        (KeyCode::Up, KeyModifiers::NONE)
+            if app.input_mode == InputMode::Slash && !app.slash_suggestions.is_empty() =>
+        {
+            let count = app.slash_suggestions.len();
+            app.slash_selected = (app.slash_selected + count - 1) % count;
+        }
+        (KeyCode::Down, KeyModifiers::NONE)
+            if app.input_mode == InputMode::Slash && !app.slash_suggestions.is_empty() =>
+        {
+            let count = app.slash_suggestions.len();
+            app.slash_selected = (app.slash_selected + 1) % count;
+        }
+        (KeyCode::Up, KeyModifiers::NONE) if !app.busy && !app.mention_suggestions.is_empty() => {
+            let count = app.mention_suggestions.len();
+            app.mention_selected = (app.mention_selected + count - 1) % count;
+        }
+        (KeyCode::Down, KeyModifiers::NONE) if !app.busy && !app.mention_suggestions.is_empty() => {
+            let count = app.mention_suggestions.len();
+            app.mention_selected = (app.mention_selected + 1) % count;
+        }
+        (KeyCode::Up, KeyModifiers::NONE) => {
+            app.chat_scroll = app.chat_scroll.saturating_add(1);
+        }
+        (KeyCode::Down, KeyModifiers::NONE) => {
+            app.chat_scroll = app.chat_scroll.saturating_sub(1);
+        }
         (KeyCode::Esc, _) if app.busy => {
-            interrupt_signal.store(true, Ordering::Relaxed);
-            app.status = "interrupting".to_string();
+            set_interrupt_signal(interrupt_signal);
+            app.status = "interrompendo".to_string();
         }
         (KeyCode::Esc, _) if !app.busy && app.input_mode == InputMode::Slash => {
             if app.input.is_empty() {
                 app.input_mode = InputMode::Default;
-                app.slash_details_expanded = false;
             }
-            refresh_slash_suggestions(app);
+            refresh_input_suggestions(app, attachment_engine);
+        }
+        (KeyCode::Esc, _) if !app.busy && !app.mention_suggestions.is_empty() => {
+            clear_mention_suggestions(app);
         }
         (KeyCode::Char('l'), KeyModifiers::CONTROL) if !app.busy => {
             app.chat.clear();
@@ -391,32 +1276,48 @@ async fn handle_key_event(
             app.stream_idx = None;
             app.thinking_idx = None;
         }
-        (KeyCode::Up, _) if !app.busy && app.input_mode == InputMode::Slash => {
-            if !app.slash_suggestions.is_empty() {
-                let count = app.slash_suggestions.len();
-                app.slash_selected = (app.slash_selected + count - 1) % count;
-            }
-        }
-        (KeyCode::Down, _) if !app.busy && app.input_mode == InputMode::Slash => {
-            if !app.slash_suggestions.is_empty() {
-                let count = app.slash_suggestions.len();
-                app.slash_selected = (app.slash_selected + 1) % count;
-            }
-        }
         (KeyCode::Tab, _) if !app.busy && app.input_mode == InputMode::Slash => {
             apply_selected_slash_suggestion(app);
+        }
+        (KeyCode::Tab, _) if !app.busy && !app.mention_suggestions.is_empty() => {
+            if apply_selected_mention_suggestion(app) {
+                refresh_input_suggestions(app, attachment_engine);
+            }
+        }
+        (KeyCode::BackTab, KeyModifiers::SHIFT | KeyModifiers::NONE)
+            if !app.busy && app.input_mode == InputMode::Default && app.input.is_empty() =>
+        {
+            queue_agent_cycle(app, true);
+        }
+        (KeyCode::Tab, KeyModifiers::NONE)
+            if !app.busy && app.input_mode == InputMode::Default && app.input.is_empty() =>
+        {
+            queue_agent_cycle(app, false);
+        }
+        (KeyCode::Char('?'), _)
+            if matches!(
+                app.active_agent,
+                BuiltinAgent::Default | BuiltinAgent::Build
+            ) && app.input.is_empty()
+                && !app.busy =>
+        {
+            app.yolo_mode = !app.yolo_mode;
+            if let Some(tx) = cmd_tx {
+                let _ = tx.send(WorkerCommand::SetAutoApprove(app.yolo_mode)).await;
+            }
         }
         (KeyCode::Enter, KeyModifiers::CONTROL | KeyModifiers::ALT) if !app.busy => {
             app.input.push('\n');
         }
         (KeyCode::Enter, _) if !app.busy => {
             if let Some(tx) = cmd_tx {
-                if submit_prompt(app, tx, tool_index_by_id).await {
+                if submit_prompt(app, attachment_engine, tx, tool_index_by_id, rewind_manager).await
+                {
                     return true;
                 }
             } else {
                 app.chat.push(ChatItem::Error(
-                    "Model is not initialized yet. Complete setup first.".to_string(),
+                    "O modelo ainda não foi inicializado. Conclua o setup primeiro.".to_string(),
                 ));
             }
         }
@@ -426,38 +1327,22 @@ async fn handle_key_event(
             } else {
                 app.input.pop();
             }
-            refresh_slash_suggestions(app);
+            prune_detached_placeholders(app);
+            refresh_input_suggestions(app, attachment_engine);
         }
         (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) if !app.busy => {
             if ch == '/' && app.input.is_empty() && app.input_mode == InputMode::Default {
                 app.input_mode = InputMode::Slash;
-                app.slash_details_expanded = false;
-                refresh_slash_suggestions(app);
+                refresh_input_suggestions(app, attachment_engine);
             } else {
                 app.input.push(ch);
-                refresh_slash_suggestions(app);
+                refresh_input_suggestions(app, attachment_engine);
             }
         }
         _ => {}
     }
 
     false
-}
-
-fn handle_mouse_event(mouse: MouseEvent, app: &mut AppState) {
-    if app.screen != UiScreen::Chat {
-        return;
-    }
-
-    match mouse.kind {
-        MouseEventKind::ScrollUp => {
-            app.chat_scroll = app.chat_scroll.saturating_add(3);
-        }
-        MouseEventKind::ScrollDown => {
-            app.chat_scroll = app.chat_scroll.saturating_sub(3);
-        }
-        _ => {}
-    }
 }
 
 fn resolve_selected_model(config: &NcConfig) -> &'static ModelSpec {
@@ -482,8 +1367,7 @@ fn build_variant_choices(
     };
     let recommended_name = recommend(hw, model).map(|q| q.name);
 
-    model
-        .quantizations
+    model_quantizations(model)
         .iter()
         .map(|quant| SetupChoice {
             quant_name: quant.name.to_string(),
@@ -517,7 +1401,7 @@ fn refresh_model_setup_selection(
         setup.current_model_display_name.clear();
         setup.choices.clear();
         setup.selected_idx = 0;
-        setup.status_line = "No models available in catalog.".to_string();
+        setup.status_line = "Nenhum modelo disponível no catálogo.".to_string();
         return;
     };
 
@@ -533,12 +1417,12 @@ fn refresh_model_setup_selection(
 
 fn update_model_setup_status(setup: &mut ModelSetupState) {
     if setup.models.is_empty() {
-        setup.status_line = "No models available in catalog.".to_string();
+        setup.status_line = "Nenhum modelo disponível no catálogo.".to_string();
         return;
     }
 
     let Some(model) = setup.models.get(setup.selected_model_idx) else {
-        setup.status_line = "Select a model.".to_string();
+        setup.status_line = "Selecione um modelo.".to_string();
         return;
     };
 
@@ -546,19 +1430,19 @@ fn update_model_setup_status(setup: &mut ModelSetupState) {
         ModelSetupView::Models => {
             if let Some(active_quant) = &model.active_quant {
                 format!(
-                    "Selected: {} · active {} · {} cached variant(s).",
+                    "Selecionado: {} · ativo {} · {} variante(s) em cache.",
                     model.model_display_name,
                     active_quant,
                     model.cached_quants.len()
                 )
             } else if model.cached_quants.is_empty() {
                 format!(
-                    "Selected: {}. No cached variants yet. Press Enter to choose one.",
+                    "Selecionado: {}. Ainda não há variantes em cache. Pressione Enter para escolher uma.",
                     model.model_display_name
                 )
             } else {
                 format!(
-                    "Selected: {} · {} cached variant(s). Press Enter to choose variant.",
+                    "Selecionado: {} · {} variante(s) em cache. Pressione Enter para escolher a variante.",
                     model.model_display_name,
                     model.cached_quants.len()
                 )
@@ -568,17 +1452,17 @@ fn update_model_setup_status(setup: &mut ModelSetupState) {
             if let Some(choice) = setup.choices.get(setup.selected_idx) {
                 if choice.cached {
                     format!(
-                        "Variant {} is cached. Enter activates it and removes other cached variants.",
+                        "A variante {} está em cache. Enter ativa e remove as outras variantes em cache.",
                         choice.quant_name
                     )
                 } else {
                     format!(
-                        "Variant {} is not cached. Enter downloads and activates it.",
+                        "A variante {} não está em cache. Enter baixa e ativa.",
                         choice.quant_name
                     )
                 }
             } else {
-                "No quantizations available for selected model.".to_string()
+                "Nenhuma quantização disponível para o modelo selecionado.".to_string()
             }
         }
     };
@@ -655,16 +1539,16 @@ fn build_model_setup_state(config: &NcConfig, hw: &HardwareInfo) -> ModelSetupSt
 
 fn permission_to_value(permission: &ToolPermissionConfig) -> &'static str {
     match permission {
-        ToolPermissionConfig::Always => "always",
-        ToolPermissionConfig::Never => "never",
-        ToolPermissionConfig::Ask => "ask",
+        ToolPermissionConfig::Always => "sempre",
+        ToolPermissionConfig::Never => "nunca",
+        ToolPermissionConfig::Ask => "perguntar",
     }
 }
 
 fn parse_permission(value: &str) -> ToolPermissionConfig {
     match value {
-        "always" => ToolPermissionConfig::Always,
-        "never" => ToolPermissionConfig::Never,
+        "sempre" => ToolPermissionConfig::Always,
+        "nunca" => ToolPermissionConfig::Never,
         _ => ToolPermissionConfig::Ask,
     }
 }
@@ -687,9 +1571,9 @@ fn cycle_config_value(state: &mut ConfigScreenState, step: i32) {
     field.value = field.options[next_idx].clone();
     state.error_line = None;
     state.status_line = if state.is_dirty() {
-        "Unsaved changes. Press Esc to save and close.".to_string()
+        "Alterações não salvas. Pressione Esc para salvar e fechar.".to_string()
     } else {
-        "No pending changes. Press Esc to return to chat.".to_string()
+        "Sem alterações pendentes. Pressione Esc para voltar ao chat.".to_string()
     };
 }
 
@@ -719,41 +1603,44 @@ fn build_config_screen_state(
         .model
         .context_size
         .map(|v| v.to_string())
-        .unwrap_or_else(|| "Auto".to_string());
+        .unwrap_or_else(|| "Automático".to_string());
     let kv_k_value = config
         .model
         .kv_cache_type_k
         .clone()
-        .unwrap_or_else(|| "Auto".to_string());
+        .unwrap_or_else(|| "Automático".to_string());
     let kv_v_value = config
         .model
         .kv_cache_type_v
         .clone()
-        .unwrap_or_else(|| "Auto".to_string());
+        .unwrap_or_else(|| "Automático".to_string());
 
     let mut fields = vec![
         ConfigField {
             key: ConfigFieldKey::NGpuLayers,
-            label: "GPU Layers".to_string(),
+            label: "Camadas de GPU".to_string(),
             value: if config.model.n_gpu_layers == 0 {
-                "CPU only (0)".to_string()
+                "Somente CPU (0)".to_string()
             } else {
-                "Auto (-1)".to_string()
+                "Automático (adaptativo)".to_string()
             },
             initial_value: if config.model.n_gpu_layers == 0 {
-                "CPU only (0)".to_string()
+                "Somente CPU (0)".to_string()
             } else {
-                "Auto (-1)".to_string()
+                "Automático (adaptativo)".to_string()
             },
-            options: vec!["Auto (-1)".to_string(), "CPU only (0)".to_string()],
+            options: vec![
+                "Automático (adaptativo)".to_string(),
+                "Somente CPU (0)".to_string(),
+            ],
         },
         ConfigField {
             key: ConfigFieldKey::ContextSize,
-            label: "Context Size".to_string(),
+            label: "Tamanho de contexto".to_string(),
             value: context_value.clone(),
             initial_value: context_value,
             options: vec![
-                "Auto".to_string(),
+                "Automático".to_string(),
                 "8192".to_string(),
                 "16384".to_string(),
                 "32768".to_string(),
@@ -764,11 +1651,11 @@ fn build_config_screen_state(
         },
         ConfigField {
             key: ConfigFieldKey::KvCacheTypeK,
-            label: "KV Cache K".to_string(),
+            label: "Cache KV K".to_string(),
             value: kv_k_value.clone(),
             initial_value: kv_k_value,
             options: vec![
-                "Auto".to_string(),
+                "Automático".to_string(),
                 "q8_0".to_string(),
                 "q4_0".to_string(),
                 "f16".to_string(),
@@ -776,11 +1663,11 @@ fn build_config_screen_state(
         },
         ConfigField {
             key: ConfigFieldKey::KvCacheTypeV,
-            label: "KV Cache V".to_string(),
+            label: "Cache KV V".to_string(),
             value: kv_v_value.clone(),
             initial_value: kv_v_value,
             options: vec![
-                "Auto".to_string(),
+                "Automático".to_string(),
                 "q8_0".to_string(),
                 "q4_0".to_string(),
                 "f16".to_string(),
@@ -788,31 +1675,47 @@ fn build_config_screen_state(
         },
         ConfigField {
             key: ConfigFieldKey::BashPermission,
-            label: "bash permission".to_string(),
+            label: "Permissão do bash".to_string(),
             value: permission_to_value(&config.tools.bash.permission).to_string(),
             initial_value: permission_to_value(&config.tools.bash.permission).to_string(),
-            options: vec!["ask".to_string(), "always".to_string(), "never".to_string()],
+            options: vec![
+                "perguntar".to_string(),
+                "sempre".to_string(),
+                "nunca".to_string(),
+            ],
         },
         ConfigField {
             key: ConfigFieldKey::WriteFilePermission,
-            label: "write_file permission".to_string(),
+            label: "Permissão do write_file".to_string(),
             value: permission_to_value(&config.tools.write_file.permission).to_string(),
             initial_value: permission_to_value(&config.tools.write_file.permission).to_string(),
-            options: vec!["ask".to_string(), "always".to_string(), "never".to_string()],
+            options: vec![
+                "perguntar".to_string(),
+                "sempre".to_string(),
+                "nunca".to_string(),
+            ],
         },
         ConfigField {
             key: ConfigFieldKey::GrepPermission,
-            label: "grep permission".to_string(),
+            label: "Permissão do grep".to_string(),
             value: permission_to_value(&config.tools.grep.permission).to_string(),
             initial_value: permission_to_value(&config.tools.grep.permission).to_string(),
-            options: vec!["ask".to_string(), "always".to_string(), "never".to_string()],
+            options: vec![
+                "perguntar".to_string(),
+                "sempre".to_string(),
+                "nunca".to_string(),
+            ],
         },
         ConfigField {
             key: ConfigFieldKey::ReadFilePermission,
-            label: "read_file permission".to_string(),
+            label: "Permissão do read_file".to_string(),
             value: permission_to_value(&config.tools.read_file.permission).to_string(),
             initial_value: permission_to_value(&config.tools.read_file.permission).to_string(),
-            options: vec!["ask".to_string(), "always".to_string(), "never".to_string()],
+            options: vec![
+                "perguntar".to_string(),
+                "sempre".to_string(),
+                "nunca".to_string(),
+            ],
         },
     ];
 
@@ -836,7 +1739,7 @@ fn build_config_screen_state(
         sessions_path: NcConfig::sessions_dir().display().to_string(),
         fields,
         selected_idx: 0,
-        status_line: "No pending changes. Press Esc to return to chat.".to_string(),
+        status_line: "Sem alterações pendentes. Pressione Esc para voltar ao chat.".to_string(),
         error_line: None,
     }
 }
@@ -847,14 +1750,18 @@ fn apply_config_screen_changes(config: &mut NcConfig, state: &ConfigScreenState)
     for field in &state.fields {
         match field.key {
             ConfigFieldKey::NGpuLayers => {
-                let value = if field.value == "CPU only (0)" { 0 } else { -1 };
+                let value = if field.value == "Somente CPU (0)" {
+                    0
+                } else {
+                    -1
+                };
                 if config.model.n_gpu_layers != value {
                     config.model.n_gpu_layers = value;
                     changed = true;
                 }
             }
             ConfigFieldKey::ContextSize => {
-                let value = if field.value == "Auto" {
+                let value = if field.value == "Automático" {
                     None
                 } else {
                     field.value.parse::<u32>().ok()
@@ -865,7 +1772,7 @@ fn apply_config_screen_changes(config: &mut NcConfig, state: &ConfigScreenState)
                 }
             }
             ConfigFieldKey::KvCacheTypeK => {
-                let value = if field.value == "Auto" {
+                let value = if field.value == "Automático" {
                     None
                 } else {
                     Some(field.value.clone())
@@ -876,7 +1783,7 @@ fn apply_config_screen_changes(config: &mut NcConfig, state: &ConfigScreenState)
                 }
             }
             ConfigFieldKey::KvCacheTypeV => {
-                let value = if field.value == "Auto" {
+                let value = if field.value == "Automático" {
                     None
                 } else {
                     Some(field.value.clone())
@@ -1128,6 +2035,8 @@ fn start_chat_worker(
     ctv_override: Option<String>,
     active_agent: BuiltinAgent,
     interrupt_signal: Arc<AtomicBool>,
+    resume_session_id: Option<String>,
+    initial_messages: Vec<LlmMessage>,
 ) -> Result<(
     mpsc::Sender<WorkerCommand>,
     Receiver<WorkerEvent>,
@@ -1135,19 +2044,26 @@ fn start_chat_worker(
     u32,
 )> {
     let runtime = build_runtime(config, ctk_override, ctv_override)
-        .map_err(|e| anyhow!("Failed to initialize runtime: {e}"))?;
+        .map_err(|e| anyhow!("Falha ao inicializar runtime: {e}"))?;
     let telemetry_hw = runtime.hardware.clone();
     let max_context_tokens = runtime.config.model.context_size.unwrap_or(200_000);
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCommand>(8);
     let agent_policy = AgentPolicy::from_builtin(active_agent);
-    let evt_rx = spawn_worker(runtime, agent_policy, cmd_rx, interrupt_signal);
+    let evt_rx = spawn_worker(
+        runtime,
+        agent_policy,
+        cmd_rx,
+        interrupt_signal,
+        resume_session_id,
+        initial_messages,
+    );
     Ok((cmd_tx, evt_rx, telemetry_hw, max_context_tokens))
 }
 
 fn start_download_task(model: &'static ModelSpec, quant_name: &str) -> Result<DownloadTask> {
     let quant = find_quant_by_name(model, quant_name)
-        .ok_or_else(|| anyhow!("Unknown quantization selected: {}", quant_name))?;
+        .ok_or_else(|| anyhow!("Quantização selecionada desconhecida: {}", quant_name))?;
 
     let downloader = Downloader::new();
     let (progress_tx, progress_rx) = mpsc::channel(100);
@@ -1177,12 +2093,14 @@ async fn restart_chat_worker(
     ctk_override: Option<String>,
     ctv_override: Option<String>,
     interrupt_signal: Arc<AtomicBool>,
+    resume_session_id: Option<String>,
+    initial_messages: Vec<LlmMessage>,
 ) -> Result<()> {
     if let Some(cmd_tx) = worker_cmd_tx.take() {
         let _ = cmd_tx.send(WorkerCommand::Shutdown).await;
     }
     *worker_evt_rx = None;
-    interrupt_signal.store(false, Ordering::Relaxed);
+    clear_interrupt_signal(&interrupt_signal);
 
     let (cmd_tx, evt_rx, hw, max_context_tokens) = start_chat_worker(
         config,
@@ -1190,12 +2108,14 @@ async fn restart_chat_worker(
         ctv_override,
         app.active_agent,
         interrupt_signal,
+        resume_session_id,
+        initial_messages,
     )?;
     *worker_cmd_tx = Some(cmd_tx);
     *worker_evt_rx = Some(evt_rx);
     *telemetry_hw = hw;
     app.max_context_tokens = max_context_tokens;
-    app.status = "initializing model...".to_string();
+    app.status = "inicializando modelo...".to_string();
     app.busy = true;
     app.busy_started_at = Some(Instant::now());
     Ok(())
@@ -1207,7 +2127,10 @@ pub async fn run_tui(
     ctv_override: Option<String>,
     setup_only: bool,
     initial_agent: BuiltinAgent,
+    resume_session_id: Option<String>,
 ) -> Result<()> {
+    preload_dynamic_quantizations().await;
+
     let initial_hw = HardwareInfo::detect();
     let selected_model = resolve_selected_model(config);
     let fallback_limits = recommend_runtime_limits(
@@ -1223,12 +2146,34 @@ pub async fn run_tui(
         initial_hw.sample_runtime_telemetry(),
         initial_agent,
     );
+    refresh_skill_catalog(&mut app, config);
+    app.mcp_servers_count = config.mcp_servers.len();
+    let mut attachment_engine =
+        AttachmentEngine::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     app.setup_only = setup_only;
     app.needs_model_setup = setup_only || !has_installed_model;
+
+    let mut bootstrap_resume_id: Option<String> = None;
+    let mut bootstrap_messages: Vec<LlmMessage> = Vec::new();
+    if let Some(session_id_query) = resume_session_id.as_deref() {
+        let Some((resolved_id, loaded_messages)) =
+            load_session_by_id_sync(&NcConfig::sessions_dir(), session_id_query)?
+        else {
+            return Err(anyhow!(
+                "Sessão '{}' não encontrada em {}",
+                session_id_query,
+                NcConfig::sessions_dir().display()
+            ));
+        };
+        restore_chat_from_session_messages(&mut app, &loaded_messages, &resolved_id);
+        bootstrap_resume_id = Some(resolved_id);
+        bootstrap_messages = loaded_messages;
+    }
+
     if app.needs_model_setup {
         app.model_setup = Some(build_model_setup_state(config, &initial_hw));
         app.model_setup_can_cancel = false;
-        app.status = "setup required".to_string();
+        app.status = "setup necessário".to_string();
         app.busy = false;
         app.busy_started_at = None;
         if setup_only {
@@ -1238,6 +2183,7 @@ pub async fn run_tui(
 
     let mut worker_cmd_tx: Option<mpsc::Sender<WorkerCommand>> = None;
     let mut worker_evt_rx: Option<Receiver<WorkerEvent>> = None;
+    let mut rewind_manager = RewindManager::default();
     let interrupt_signal = Arc::new(AtomicBool::new(false));
     let mut telemetry_hw = initial_hw;
 
@@ -1251,6 +2197,8 @@ pub async fn run_tui(
             ctk_override.clone(),
             ctv_override.clone(),
             interrupt_signal.clone(),
+            bootstrap_resume_id,
+            bootstrap_messages,
         )
         .await?;
     }
@@ -1258,20 +2206,31 @@ pub async fn run_tui(
     let mut terminal = setup_terminal()?;
     let mut should_quit = false;
     let mut tool_index_by_id: HashMap<String, usize> = HashMap::new();
+    let telemetry_refresh_interval = Duration::from_millis(900);
+    let spinner_interval = Duration::from_millis(40);
+    let poll_busy_interval = Duration::from_millis(8);
+    let poll_idle_interval = Duration::from_millis(80);
+    let download_poll_interval = Duration::from_millis(25);
     let mut last_telemetry_refresh = Instant::now()
         .checked_sub(Duration::from_secs(2))
         .unwrap_or_else(Instant::now);
+    let mut last_spinner_tick = Instant::now();
     let mut download_task: Option<DownloadTask> = None;
+    let mut needs_redraw = true;
 
     while !should_quit {
-        if last_telemetry_refresh.elapsed() >= Duration::from_millis(900) {
+        let now = Instant::now();
+
+        if now.duration_since(last_telemetry_refresh) >= telemetry_refresh_interval {
             app.telemetry = telemetry_hw.sample_runtime_telemetry();
-            last_telemetry_refresh = Instant::now();
+            last_telemetry_refresh = now;
+            needs_redraw = true;
         }
 
         if let Some(evt_rx) = worker_evt_rx.as_ref() {
             while let Ok(evt) = evt_rx.try_recv() {
-                apply_worker_event(&mut app, evt, &mut tool_index_by_id);
+                apply_worker_event(&mut app, evt, &mut tool_index_by_id, &mut rewind_manager);
+                needs_redraw = true;
             }
         }
 
@@ -1298,17 +2257,19 @@ pub async fn run_tui(
                         speed_bps: progress.speed_bps,
                         eta_seconds: progress.eta_seconds,
                     });
+                    needs_redraw = true;
                 }
             }
 
             if task.handle.is_finished() {
+                needs_redraw = true;
                 let completed = download_task.take().expect("download task should exist");
                 let model_id = completed.model_id.clone();
                 let quant_name = completed.quant_name.clone();
                 let result = completed
                     .handle
                     .await
-                    .map_err(|e| anyhow!("Download task failed: {e}"))?;
+                    .map_err(|e| anyhow!("Tarefa de download falhou: {e}"))?;
 
                 match result {
                     Ok(_path) => {
@@ -1319,10 +2280,10 @@ pub async fn run_tui(
                             if let Some(setup) = app.model_setup.as_mut() {
                                 setup.downloading = false;
                                 setup.error_line = Some(format!(
-                                    "Failed to clean previous cached variants: {err}"
+                                    "Falha ao limpar variantes anteriores em cache: {err}"
                                 ));
                                 setup.status_line =
-                                    "Download finished, but cache cleanup failed. Selection not applied."
+                                    "Download concluído, mas a limpeza de cache falhou. Seleção não aplicada."
                                         .to_string();
                                 setup.progress_line = None;
                                 setup.download_progress = None;
@@ -1350,22 +2311,24 @@ pub async fn run_tui(
                                     ctk_override.clone(),
                                     ctv_override.clone(),
                                     interrupt_signal.clone(),
+                                    None,
+                                    Vec::new(),
                                 )
                                 .await
                                 {
                                     if let Some(setup) = app.model_setup.as_mut() {
                                         setup.downloading = false;
                                         setup.error_line =
-                                            Some(format!("Failed to initialize model: {err}"));
+                                            Some(format!("Falha ao inicializar modelo: {err}"));
                                         setup.status_line =
-                                            "Model ready on disk, but runtime failed to start. Try another quantization."
+                                            "Modelo pronto no disco, mas a inicialização falhou. Tente outra quantização."
                                                 .to_string();
                                         setup.progress_line = None;
                                         setup.download_progress = None;
                                     }
                                     app.model_setup_can_cancel = true;
                                     app.screen = UiScreen::ModelSetup;
-                                    app.status = "model setup".to_string();
+                                    app.status = "setup de modelo".to_string();
                                     app.busy = false;
                                     app.busy_started_at = None;
                                     continue;
@@ -1381,7 +2344,8 @@ pub async fn run_tui(
                             setup.downloading = false;
                             setup.error_line = Some(err.to_string());
                             setup.status_line =
-                                "Download failed. Select a quantization and try again.".to_string();
+                                "Falha no download. Selecione uma quantização e tente novamente."
+                                    .to_string();
                             setup.progress_line = None;
                             setup.download_progress = None;
                         }
@@ -1390,10 +2354,47 @@ pub async fn run_tui(
             }
         }
 
-        app.spinner_idx = app.spinner_idx.wrapping_add(1);
-        draw_ui(&mut terminal, &app)?;
+        if app.busy || download_task.is_some() || matches!(app.screen, UiScreen::Welcome) {
+            if now.duration_since(last_spinner_tick) >= spinner_interval {
+                app.spinner_idx = app.spinner_idx.wrapping_add(1);
+                last_spinner_tick = now;
+                needs_redraw = true;
+            }
+        }
 
-        if event::poll(Duration::from_millis(50))? {
+        if needs_redraw {
+            draw_ui(&mut terminal, &app)?;
+            needs_redraw = false;
+        }
+
+        let mut poll_timeout = if app.busy
+            || app.pending_approval.is_some()
+            || app.pending_user_question.is_some()
+            || app.pending_plan_review.is_some()
+            || app.pending_resume_selection.is_some()
+        {
+            poll_busy_interval
+        } else {
+            poll_idle_interval
+        };
+
+        if download_task.is_some() && poll_timeout > download_poll_interval {
+            poll_timeout = download_poll_interval;
+        }
+
+        if app.busy {
+            let elapsed_since_spinner = now.duration_since(last_spinner_tick);
+            if elapsed_since_spinner < spinner_interval {
+                let until_next_spinner = spinner_interval - elapsed_since_spinner;
+                if until_next_spinner < poll_timeout {
+                    poll_timeout = until_next_spinner;
+                }
+            } else {
+                poll_timeout = Duration::from_millis(0);
+            }
+        }
+
+        if event::poll(poll_timeout)? {
             match event::read()? {
                 Event::Key(key) => match app.screen {
                     UiScreen::ModelSetup => {
@@ -1402,7 +2403,7 @@ pub async fn run_tui(
                                 app.model_setup = None;
                                 app.model_setup_can_cancel = false;
                                 app.screen = UiScreen::Chat;
-                                app.status = "ready".to_string();
+                                app.status = "pronto".to_string();
                                 app.busy = false;
                                 app.busy_started_at = None;
                             }
@@ -1417,7 +2418,7 @@ pub async fn run_tui(
                                     state.downloading = false;
                                     state.error_line = None;
                                     state.status_line =
-                                        "Download canceled. Partial file kept for resume."
+                                        "Download cancelado. Arquivo parcial mantido para retomada."
                                             .to_string();
                                     state.progress_line = None;
                                     state.download_progress = None;
@@ -1433,7 +2434,7 @@ pub async fn run_tui(
                                 if setup.choices.is_empty() {
                                     if let Some(state) = app.model_setup.as_mut() {
                                         state.error_line =
-                                            Some("No quantizations available".to_string());
+                                            Some("Nenhuma quantização disponível".to_string());
                                     }
                                     continue;
                                 }
@@ -1452,10 +2453,10 @@ pub async fn run_tui(
                                     ) {
                                         if let Some(state) = app.model_setup.as_mut() {
                                             state.error_line = Some(format!(
-                                                "Failed to clean previous cached variants: {err}"
+                                                "Falha ao limpar variantes anteriores em cache: {err}"
                                             ));
                                             state.status_line =
-                                                "Cache cleanup failed. Variant was not activated."
+                                                "A limpeza de cache falhou. A variante não foi ativada."
                                                     .to_string();
                                             state.progress_line = None;
                                             state.download_progress = None;
@@ -1484,29 +2485,31 @@ pub async fn run_tui(
                                                 ctk_override.clone(),
                                                 ctv_override.clone(),
                                                 interrupt_signal.clone(),
+                                                None,
+                                                Vec::new(),
                                             )
                                             .await
                                             {
                                                 if let Some(state) = app.model_setup.as_mut() {
                                                     state.downloading = false;
                                                     state.error_line = Some(format!(
-                                                        "Failed to initialize model: {err}"
+                                                        "Falha ao inicializar modelo: {err}"
                                                     ));
                                                     state.status_line =
-                                                        "Could not activate selected model. Pick another quantization."
+                                                        "Não foi possível ativar o modelo selecionado. Escolha outra quantização."
                                                             .to_string();
                                                     state.progress_line = None;
                                                     state.download_progress = None;
                                                 }
                                                 app.model_setup_can_cancel = true;
                                                 app.screen = UiScreen::ModelSetup;
-                                                app.status = "model setup".to_string();
+                                                app.status = "setup de modelo".to_string();
                                                 app.busy = false;
                                                 app.busy_started_at = None;
                                                 continue;
                                             }
                                         } else {
-                                            app.status = "ready".to_string();
+                                            app.status = "pronto".to_string();
                                             app.busy = false;
                                             app.busy_started_at = None;
                                         }
@@ -1522,11 +2525,11 @@ pub async fn run_tui(
                                             .unwrap_or_else(|| format!("{quant_name}.gguf"));
                                         state.downloading = true;
                                         state.status_line = format!(
-                                            "Downloading {} ({}) from Hugging Face...",
+                                            "Baixando {} ({}) do Hugging Face...",
                                             state.current_model_display_name, quant_name
                                         );
                                         state.progress_line =
-                                            Some("Starting download...".to_string());
+                                            Some("Iniciando download...".to_string());
                                         state.download_progress = Some(DownloadProgressView {
                                             filename,
                                             downloaded: 0,
@@ -1546,7 +2549,7 @@ pub async fn run_tui(
                         ConfigScreenAction::CloseNoSave => {
                             app.config_screen = None;
                             app.screen = UiScreen::Chat;
-                            app.status = "ready".to_string();
+                            app.status = "pronto".to_string();
                             app.busy = false;
                             app.busy_started_at = None;
                         }
@@ -1564,9 +2567,9 @@ pub async fn run_tui(
                                 app.config_screen = None;
                                 app.screen = UiScreen::Chat;
                                 app.chat.push(ChatItem::Assistant(
-                                    "Configuration closed (no changes).".to_string(),
+                                    "Configuração fechada (sem alterações).".to_string(),
                                 ));
-                                app.status = "ready".to_string();
+                                app.status = "pronto".to_string();
                                 app.busy = false;
                                 app.busy_started_at = None;
                                 continue;
@@ -1576,10 +2579,12 @@ pub async fn run_tui(
                             if let Err(err) = config.save() {
                                 *config = previous_config;
                                 if let Some(state) = app.config_screen.as_mut() {
-                                    state.error_line =
-                                        Some(format!("Failed to save config file: {err}"));
+                                    state.error_line = Some(format!(
+                                        "Falha ao salvar arquivo de configuração: {err}"
+                                    ));
                                     state.status_line =
-                                        "Save failed. Fix settings and try again.".to_string();
+                                        "Falha ao salvar. Ajuste as configurações e tente novamente."
+                                            .to_string();
                                 }
                                 continue;
                             }
@@ -1593,6 +2598,8 @@ pub async fn run_tui(
                                 ctk_override.clone(),
                                 ctv_override.clone(),
                                 interrupt_signal.clone(),
+                                None,
+                                Vec::new(),
                             )
                             .await
                             {
@@ -1608,15 +2615,17 @@ pub async fn run_tui(
                                     ctk_override.clone(),
                                     ctv_override.clone(),
                                     interrupt_signal.clone(),
+                                    None,
+                                    Vec::new(),
                                 )
                                 .await;
 
                                 if let Some(state) = app.config_screen.as_mut() {
                                     state.error_line = Some(format!(
-                                        "Failed to apply configuration: {restart_err}"
+                                        "Falha ao aplicar configuração: {restart_err}"
                                     ));
                                     state.status_line =
-                                        "Configuration reverted. Adjust values and try again."
+                                        "Configuração revertida. Ajuste os valores e tente novamente."
                                             .to_string();
                                 }
                                 continue;
@@ -1625,7 +2634,7 @@ pub async fn run_tui(
                             app.config_screen = None;
                             app.screen = UiScreen::Chat;
                             app.chat.push(ChatItem::Assistant(
-                                "Configuration saved and applied.".to_string(),
+                                "Configuração salva e aplicada.".to_string(),
                             ));
                         }
                         ConfigScreenAction::None => {}
@@ -1634,11 +2643,77 @@ pub async fn run_tui(
                         should_quit = handle_key_event(
                             key,
                             &mut app,
+                            &mut attachment_engine,
                             worker_cmd_tx.as_ref(),
                             &interrupt_signal,
                             &mut tool_index_by_id,
+                            &mut rewind_manager,
                         )
                         .await;
+
+                        if let Some(resume_request) = app.requested_resume_session.take() {
+                            match load_session_by_id_sync(
+                                &NcConfig::sessions_dir(),
+                                &resume_request.session_id_query,
+                            ) {
+                                Ok(Some((resolved_id, loaded_messages))) => {
+                                    restore_chat_from_session_messages(
+                                        &mut app,
+                                        &loaded_messages,
+                                        &resolved_id,
+                                    );
+                                    app.pending_resume_selection = None;
+                                    app.input.clear();
+                                    app.input_mode = InputMode::Default;
+                                    clear_pending_pastes(&mut app);
+                                    refresh_input_suggestions(&mut app, &mut attachment_engine);
+                                    tool_index_by_id.clear();
+
+                                    match restart_chat_worker(
+                                        &mut worker_cmd_tx,
+                                        &mut worker_evt_rx,
+                                        &mut telemetry_hw,
+                                        &mut app,
+                                        config,
+                                        ctk_override.clone(),
+                                        ctv_override.clone(),
+                                        interrupt_signal.clone(),
+                                        Some(resolved_id.clone()),
+                                        loaded_messages,
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {
+                                            app.status = format!(
+                                                "sessão retomada: {}",
+                                                short_session_id(&resolved_id)
+                                            );
+                                        }
+                                        Err(err) => {
+                                            app.chat.push(ChatItem::Error(format!(
+                                                "Falha ao retomar sessão `{}`: {}",
+                                                resolved_id, err
+                                            )));
+                                            app.status = "falha ao retomar".to_string();
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    app.chat.push(ChatItem::Error(format!(
+                                        "Sessão `{}` não encontrada.",
+                                        resume_request.session_id_query
+                                    )));
+                                    app.status = "sessão não encontrada".to_string();
+                                }
+                                Err(err) => {
+                                    app.chat.push(ChatItem::Error(format!(
+                                        "Falha ao carregar sessão `{}`: {}",
+                                        resume_request.session_id_query, err
+                                    )));
+                                    app.status = "falha ao retomar".to_string();
+                                }
+                            }
+                        }
 
                         if app.open_settings_requested {
                             app.open_settings_requested = false;
@@ -1653,7 +2728,7 @@ pub async fn run_tui(
                             app.model_setup = None;
                             app.model_setup_can_cancel = false;
                             app.screen = UiScreen::Config;
-                            app.status = "configuration".to_string();
+                            app.status = "configuração".to_string();
                             app.busy = false;
                             app.busy_started_at = None;
                         }
@@ -1665,21 +2740,76 @@ pub async fn run_tui(
                             app.model_setup_can_cancel = true;
                             app.screen = UiScreen::ModelSetup;
                             app.needs_model_setup = false;
-                            app.status = "model setup".to_string();
+                            app.status = "setup de modelo".to_string();
                             app.busy = false;
                             app.busy_started_at = None;
                         }
 
-                        if let Some(next_agent) = app.requested_agent_switch.take() {
+                        if app.compact_requested {
+                            app.compact_requested = false;
+                            if let Some(cmd_tx) = worker_cmd_tx.as_ref() {
+                                let _ = cmd_tx.send(WorkerCommand::Compact).await;
+                            }
+                        }
+
+                        if app.reload_requested {
+                            app.reload_requested = false;
+                            match NcConfig::load() {
+                                Ok(new_config) => {
+                                    *config = new_config;
+                                    refresh_skill_catalog(&mut app, config);
+                                    app.mcp_servers_count = config.mcp_servers.len();
+                                    refresh_input_suggestions(&mut app, &mut attachment_engine);
+                                    match restart_chat_worker(
+                                        &mut worker_cmd_tx,
+                                        &mut worker_evt_rx,
+                                        &mut telemetry_hw,
+                                        &mut app,
+                                        config,
+                                        ctk_override.clone(),
+                                        ctv_override.clone(),
+                                        interrupt_signal.clone(),
+                                        None,
+                                        Vec::new(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {
+                                            app.chat.push(ChatItem::Assistant(
+                                                "Configuração recarregada e aplicada.".to_string(),
+                                            ));
+                                        }
+                                        Err(err) => {
+                                            app.chat.push(ChatItem::Error(format!(
+                                                "Falha ao recarregar: {err}"
+                                            )));
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    app.chat.push(ChatItem::Error(format!(
+                                        "Falha ao carregar configuração: {err}"
+                                    )));
+                                    app.status = "falha ao recarregar".to_string();
+                                }
+                            }
+                        }
+
+                        if let Some(switch_request) = app.requested_agent_switch.take() {
+                            let next_agent = switch_request.target;
+                            let bootstrap_prompt = switch_request.bootstrap_prompt;
                             let previous_agent = app.active_agent;
                             app.active_agent = next_agent;
 
                             if app.needs_model_setup {
                                 app.chat.push(ChatItem::Assistant(format!(
-                                    "Agent set to `{}`. It will be applied after model setup.",
-                                    app.active_agent.as_str()
+                                    "Agente definido para `{}`. Será aplicado após o setup do modelo.",
+                                    agent_status_label(app.active_agent)
                                 )));
-                                app.status = format!("ready · agent {}", app.active_agent.as_str());
+                                app.status = format!(
+                                    "pronto · agente {}",
+                                    agent_status_label(app.active_agent)
+                                );
                                 app.busy = false;
                                 app.busy_started_at = None;
                                 continue;
@@ -1694,19 +2824,40 @@ pub async fn run_tui(
                                 ctk_override.clone(),
                                 ctv_override.clone(),
                                 interrupt_signal.clone(),
+                                None,
+                                Vec::new(),
                             )
                             .await
                             {
                                 Ok(()) => {
-                                    app.chat.push(ChatItem::Assistant(format!(
-                                        "Active agent: `{}` (session scope).",
-                                        app.active_agent.as_str()
-                                    )));
+                                    if let Some(prompt) = bootstrap_prompt {
+                                        if let Some(cmd_tx) = worker_cmd_tx.as_ref() {
+                                            let _ = cmd_tx
+                                                .send(WorkerCommand::Submit {
+                                                    prompt,
+                                                    image_data_urls: Vec::new(),
+                                                })
+                                                .await;
+                                            app.status =
+                                                "Modo implementação iniciado com contexto exclusivo do plano."
+                                                    .to_string();
+                                        } else {
+                                            app.status = format!(
+                                                "pronto · agente {}",
+                                                agent_status_label(app.active_agent)
+                                            );
+                                        }
+                                    } else {
+                                        app.status = format!(
+                                            "pronto · agente {}",
+                                            agent_status_label(app.active_agent)
+                                        );
+                                    }
                                 }
                                 Err(err) => {
                                     app.active_agent = previous_agent;
                                     app.chat.push(ChatItem::Error(format!(
-                                        "Failed to switch agent to `{}`: {}",
+                                        "Falha ao trocar agente para `{}`: {}",
                                         next_agent.as_str(),
                                         err
                                     )));
@@ -1715,15 +2866,43 @@ pub async fn run_tui(
                         }
                     }
                 },
-                Event::Mouse(mouse) => handle_mouse_event(mouse, &mut app),
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        app.chat_scroll = app.chat_scroll.saturating_add(3);
+                    }
+                    MouseEventKind::ScrollDown => {
+                        app.chat_scroll = app.chat_scroll.saturating_sub(3);
+                    }
+                    _ => continue,
+                },
+                Event::Paste(pasted) => {
+                    if matches!(app.screen, UiScreen::Welcome | UiScreen::Chat)
+                        && !app.busy
+                        && app.pending_approval.is_none()
+                        && app.pending_user_question.is_none()
+                        && app.pending_plan_review.is_none()
+                        && app.pending_resume_selection.is_none()
+                    {
+                        apply_text_paste(&mut app, &pasted, &mut attachment_engine);
+                    }
+                }
                 _ => {}
             }
+            needs_redraw = true;
         }
     }
 
     if let Some(cmd_tx) = worker_cmd_tx.as_ref() {
         let _ = cmd_tx.send(WorkerCommand::Shutdown).await;
     }
+    let session_resume_hint = app.current_session_id.clone();
     restore_terminal(terminal)?;
+    if let Some(session_id) = session_resume_hint {
+        println!();
+        println!(
+            "A sessão pode ser retomada com 'nanocode --resume {}'.",
+            session_id
+        );
+    }
     Ok(())
 }

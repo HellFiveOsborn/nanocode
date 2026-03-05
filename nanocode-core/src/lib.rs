@@ -3,9 +3,11 @@
 pub mod agent_loop;
 pub mod agents;
 pub mod config;
+pub mod interrupt;
 pub mod llm;
 pub mod middleware;
 pub mod prompts;
+pub mod skills;
 pub mod session;
 pub mod tools;
 pub mod types;

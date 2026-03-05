@@ -1,9 +1,10 @@
 use crate::config::NcConfig;
+use crate::interrupt::check_interrupt_signal;
 use crate::llm::parse_tool_calls;
-use crate::types::{LlmMessage, MessageRole};
+use crate::types::{LlmMessage, MessageContent, MessageRole};
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
@@ -34,8 +35,8 @@ struct ChatCompletionRequest {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct OpenAiMessage {
     role: String,
-    #[serde(default)]
-    content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content: Option<MessageContent>,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
@@ -181,10 +182,7 @@ where
             if !chunk.is_empty() {
                 let _ = chunk_tx.send(chunk.to_string());
             }
-            if let Some(signal) = interrupt_signal_owned.as_ref() {
-                return !signal.load(Ordering::Relaxed);
-            }
-            true
+            check_interrupt_signal(interrupt_signal_owned.as_ref()).is_ok()
         };
         handle.generate_with_chunk_callback(
             &messages,
@@ -271,7 +269,7 @@ async fn chat_completions(
 
         converted.push(LlmMessage {
             role,
-            content: m.content,
+            content: m.content.unwrap_or_default(),
             name: m.name,
             tool_call_id: m.tool_call_id,
             tool_calls: parsed_tool_calls,
@@ -329,7 +327,7 @@ async fn chat_completions(
             index: 0,
             message: OpenAiMessage {
                 role: "assistant".to_string(),
-                content: assistant_content,
+                content: Some(MessageContent::text(assistant_content)),
                 name: None,
                 tool_call_id: None,
                 tool_calls: assistant_tool_calls,

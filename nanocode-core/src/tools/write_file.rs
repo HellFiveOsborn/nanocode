@@ -5,7 +5,6 @@ use crate::types::ToolPermission;
 use crate::types::{InvokeContext, ToolError, ToolOutput};
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::path::PathBuf;
 use tokio::fs;
 
 const MAX_FILE_SIZE: u64 = 1024 * 1024; // 1MB
@@ -71,8 +70,8 @@ impl Tool for WriteFileTool {
         let args: WriteFileArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
-        // Validate path
-        let path = validate_path(&args.path)?;
+        // Validate path (prevent traversal, resolve absolute/relative)
+        let path = super::path_utils::validate_and_resolve(&args.path)?;
 
         // Check content size
         if args.content.len() as u64 > MAX_FILE_SIZE {
@@ -115,44 +114,3 @@ impl Tool for WriteFileTool {
     }
 }
 
-/// Validate path to prevent traversal attacks
-fn validate_path(path: &str) -> Result<PathBuf, ToolError> {
-    if path.starts_with('/') {
-        return Err(ToolError::InvalidArguments(
-            "Absolute paths not allowed".to_string(),
-        ));
-    }
-
-    let path_buf = PathBuf::from(path);
-    let normalized = path_buf.normalize();
-
-    if normalized.to_string_lossy().contains("..") {
-        return Err(ToolError::InvalidArguments(
-            "Path traversal not allowed".to_string(),
-        ));
-    }
-
-    Ok(normalized)
-}
-
-trait Normalize {
-    fn normalize(&self) -> Self;
-}
-
-impl Normalize for PathBuf {
-    fn normalize(&self) -> Self {
-        let mut result = Self::new();
-        for component in self.components() {
-            match component {
-                std::path::Component::ParentDir => {
-                    result.pop();
-                }
-                std::path::Component::Normal(name) => {
-                    result.push(name);
-                }
-                _ => {}
-            }
-        }
-        result
-    }
-}

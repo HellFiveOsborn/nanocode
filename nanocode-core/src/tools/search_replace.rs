@@ -5,7 +5,6 @@ use crate::types::ToolPermission;
 use crate::types::{InvokeContext, ToolError, ToolOutput};
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::path::PathBuf;
 use tokio::fs;
 
 #[derive(Debug, Deserialize)]
@@ -74,8 +73,8 @@ impl Tool for SearchReplaceTool {
         let args: SearchReplaceArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
-        // Validate path
-        let path = validate_path(&args.path)?;
+        // Validate path (prevent traversal, resolve absolute/relative)
+        let path = super::path_utils::validate_and_resolve(&args.path)?;
 
         if !path.exists() {
             return Err(ToolError::NotFound(format!(
@@ -133,33 +132,3 @@ impl Tool for SearchReplaceTool {
     }
 }
 
-fn validate_path(path: &str) -> Result<PathBuf, ToolError> {
-    if path.starts_with('/') {
-        return Err(ToolError::InvalidArguments(
-            "Absolute paths not allowed".to_string(),
-        ));
-    }
-
-    let path_buf = PathBuf::from(path);
-    let mut result = PathBuf::new();
-
-    for component in path_buf.components() {
-        match component {
-            std::path::Component::ParentDir => {
-                result.pop();
-            }
-            std::path::Component::Normal(name) => {
-                result.push(name);
-            }
-            _ => {}
-        }
-    }
-
-    if result.to_string_lossy().contains("..") {
-        return Err(ToolError::InvalidArguments(
-            "Path traversal not allowed".to_string(),
-        ));
-    }
-
-    Ok(result)
-}

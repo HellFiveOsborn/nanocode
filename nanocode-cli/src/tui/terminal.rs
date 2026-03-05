@@ -1,5 +1,10 @@
 use anyhow::Result;
+use crossterm::cursor::MoveToColumn;
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
+use crossterm::style::ResetColor;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -12,14 +17,28 @@ pub type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
 pub fn setup_terminal() -> Result<TuiTerminal> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     let backend = CrosstermBackend::new(stdout);
-    Ok(Terminal::new(backend)?)
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+    Ok(terminal)
 }
 
 pub fn restore_terminal(mut terminal: TuiTerminal) -> Result<()> {
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        ResetColor,
+        MoveToColumn(0)
+    )?;
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
 }

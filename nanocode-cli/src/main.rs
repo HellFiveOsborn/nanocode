@@ -1,17 +1,20 @@
 //! Nano Code CLI - Main entry point
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use nanocode_core::agent_loop::{AgentLoop, LoopEvent};
-use nanocode_core::agents::AgentPolicy;
+use nanocode_core::agents::{AgentPolicy, BuiltinAgent};
 use nanocode_core::llm::PromptFamily;
 use nanocode_core::prompts::load_prompt;
+use nanocode_core::session::{find_session_path_by_id_sync, latest_session_id_sync};
+use nanocode_core::skills::{install_bundled_skills_if_missing, SkillManager};
 use nanocode_core::tools::ToolManager;
-use nanocode_core::{ApprovalDecision, NcConfig};
+use nanocode_core::{ApprovalDecision, NcConfig, QuestionAnswerSource, UserQuestionResponse};
 use nanocode_hf::{
-    default_model, find_any_installed_model_quant, find_installed_quant, find_model,
-    find_quant_by_name, recommend_runtime_limits, HardwareInfo,
+    default_model, find_any_installed_model_quant, find_model, find_quant_by_name,
+    is_compatible_quant_size, preload_dynamic_quantizations, recommend_inference_tuning,
+    recommend_runtime_limits, select_cached_quant_for_hardware, HardwareInfo,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -29,43 +32,51 @@ mod tui;
 #[derive(Parser)]
 #[command(name = "nanocode")]
 #[command(version)]
-#[command(about = "AI coding assistant with local LLM", long_about = None)]
+#[command(about = "Assistente de código com LLM local", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Prompt to execute (programmatic mode)
+    /// Prompt para executar (modo programático)
     #[arg(short, long)]
     prompt: Option<String>,
 
-    /// Auto-approve all tool calls
+    /// Aprovar automaticamente todas as chamadas de ferramenta
     #[arg(long)]
     auto_approve: bool,
 
-    /// Resume last session
-    #[arg(short, long)]
+    /// Retomar a última sessão
+    #[arg(short = 'c', long = "continue", conflicts_with = "resume")]
     continue_session: bool,
 
-    /// Agent profile (default, plan, accept-edits, auto-approve)
+    /// Retomar uma sessão específica por UUID (suporta prefixo)
+    #[arg(
+        long = "resume",
+        value_name = "SESSION_ID",
+        conflicts_with = "continue_session"
+    )]
+    resume: Option<String>,
+
+    /// Perfil do agente (default, plan, build)
     #[arg(long, default_value = "default")]
     agent: String,
 
-    /// KV cache type K (ex: q8_0, q4_0, f16)
+    /// Tipo de cache KV K (ex: q8_0, q4_0, f16)
     #[arg(long = "ctk")]
     ctk: Option<String>,
 
-    /// KV cache type V (ex: q8_0, q4_0, f16)
+    /// Tipo de cache KV V (ex: q8_0, q4_0, f16)
     #[arg(long = "ctv")]
     ctv: Option<String>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Setup or reconfigure the model
+    /// Configurar ou reconfigurar o modelo
     Setup,
-    /// List available sessions
+    /// Listar sessões disponíveis
     Sessions,
-    /// Show configuration
+    /// Mostrar configuração
     Config,
 }
 
@@ -102,12 +113,26 @@ async fn main() -> Result<()> {
     });
     let cli = Cli::parse_from(normalized_args);
 
+    if let Err(err) = install_bundled_skills_if_missing() {
+        eprintln!("Aviso: falha ao instalar skills padrão: {err}");
+    }
+
     let mut config = NcConfig::load().unwrap_or_default();
     if cli.auto_approve {
         config.auto_approve = true;
     }
     let selected_agent =
         AgentPolicy::resolve(&cli.agent).map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    if selected_agent.builtin == nanocode_core::agents::BuiltinAgent::Explore {
+        return Err(anyhow::anyhow!(
+            "Explore é um subagente interno. Use --agent default, plan ou build."
+        ));
+    }
+    let resume_session_id = if cli.command.is_none() && cli.prompt.is_none() {
+        resolve_resume_session_id(&cli)?
+    } else {
+        None
+    };
 
     match &cli.command {
         Some(Commands::Setup) => {
@@ -117,6 +142,7 @@ async fn main() -> Result<()> {
                 cli.ctv.clone(),
                 true,
                 selected_agent.builtin,
+                None,
             )
             .await?
         }
@@ -126,7 +152,7 @@ async fn main() -> Result<()> {
             if let Some(prompt) = cli.prompt {
                 if !NcConfig::is_model_installed() {
                     return Err(anyhow::anyhow!(
-                        "No model installed. Run 'nanocode' to complete onboarding or 'nanocode setup'."
+                        "Nenhum modelo instalado. Execute 'nanocode' para concluir a configuração inicial ou 'nanocode setup'."
                     ));
                 }
                 run_prompt(
@@ -144,6 +170,7 @@ async fn main() -> Result<()> {
                     cli.ctv.clone(),
                     false,
                     selected_agent.builtin,
+                    resume_session_id,
                 )
                 .await?;
             }
@@ -153,17 +180,81 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn resolve_resume_session_id(cli: &Cli) -> Result<Option<String>> {
+    if let Some(query) = cli.resume.as_deref() {
+        let Some((resolved_id, _)) =
+            find_session_path_by_id_sync(&NcConfig::sessions_dir(), query)?
+        else {
+            return Err(anyhow::anyhow!(
+                "Sessão '{}' não encontrada em {}",
+                query,
+                NcConfig::sessions_dir().display()
+            ));
+        };
+        return Ok(Some(resolved_id));
+    }
+
+    if cli.continue_session {
+        let Some(session_id) = latest_session_id_sync(&NcConfig::sessions_dir())? else {
+            return Err(anyhow::anyhow!(
+                "Nenhuma sessão anterior encontrada em {}",
+                NcConfig::sessions_dir().display()
+            ));
+        };
+        return Ok(Some(session_id));
+    }
+
+    Ok(None)
+}
+
 async fn list_sessions() -> Result<()> {
     use nanocode_core::session::list_sessions;
     let sessions = list_sessions(&NcConfig::sessions_dir()).await?;
     if sessions.is_empty() {
-        println!("No sessions found.");
+        println!("Nenhuma sessão encontrada.");
     } else {
         for session in sessions {
-            println!("{} - {} messages", session.id, session.message_count);
+            println!("{} - {} mensagens", session.id, session.message_count);
         }
     }
     Ok(())
+}
+
+fn maybe_expand_skill_slash_prompt(input: &str, skill_manager: &SkillManager) -> Result<String> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with('/') {
+        return Ok(input.to_string());
+    }
+
+    let body = trimmed.trim_start_matches('/');
+    let mut parts = body.splitn(2, char::is_whitespace);
+    let skill_name = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+    if skill_name.is_empty() {
+        return Ok(input.to_string());
+    }
+
+    let Some(skill_info) = skill_manager.get_skill(&skill_name) else {
+        return Ok(input.to_string());
+    };
+    if !skill_info.user_invocable {
+        return Ok(input.to_string());
+    }
+
+    let skill_content = std::fs::read_to_string(&skill_info.skill_path).with_context(|| {
+        format!(
+            "falha ao ler skill '{}' em {}",
+            skill_info.name,
+            skill_info.skill_path.display()
+        )
+    })?;
+    let trailing = parts.next().map(str::trim).unwrap_or("");
+    if trailing.is_empty() {
+        return Ok(skill_content);
+    }
+
+    Ok(format!(
+        "{skill_content}\n\n## Contexto de Invocação da Skill\nArgs do usuário: {trailing}"
+    ))
 }
 
 fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
@@ -389,6 +480,8 @@ fn style_shimmer_text(text: &str, frame: usize) -> String {
 const THINKING_PROMPT_BOOSTER: &str = r#"
 ## Thinking Discipline
 - Keep reasoning private and brief.
+- Emit reasoning only inside `<think>...</think>`.
+- Put the final user-facing answer outside `<think>` blocks.
 - Avoid meta narration ("hmm", "wait", "I should").
 - If a tool is needed, call it quickly.
 "#;
@@ -427,7 +520,7 @@ fn emit_thinking_line(line: &str, thinking_frame: &mut usize, thinking_banner_sh
     if !*thinking_banner_shown {
         println!();
         let symbol = thinking_symbol(*thinking_frame);
-        let shimmer = style_shimmer_text("Thinking...", *thinking_frame);
+        let shimmer = style_shimmer_text("Raciocinando...", *thinking_frame);
         println!("{} {}", symbol, shimmer);
         *thinking_frame = thinking_frame.wrapping_add(1);
         *thinking_banner_shown = true;
@@ -502,45 +595,54 @@ async fn run_prompt(
     ctv_override: Option<String>,
     agent_policy: AgentPolicy,
 ) -> Result<()> {
+    preload_dynamic_quantizations().await;
+
     let configured_model = config
         .active_model
         .as_deref()
         .and_then(find_model)
         .unwrap_or_else(default_model);
     let model_path = NcConfig::models_dir();
+    let hw = HardwareInfo::detect();
+    let no_model_error = || {
+        if has_any_gguf_file(&model_path) {
+            anyhow::anyhow!(
+                "Nenhum modelo compatível está pronto. Foram encontrados arquivos .gguf, mas a quantização selecionada pode não ser suportada pela sua build local do llama.cpp (ex: IQ3_*). Execute 'nanocode setup' e escolha Q2_K, Q3_K_S ou Q4_K_M."
+            )
+        } else {
+            anyhow::anyhow!("Nenhum modelo instalado")
+        }
+    };
     let (model, quant) = if let Some(active_name) = config.active_quant.as_deref() {
         if let Some(active_quant) = find_quant_by_name(configured_model, active_name) {
             let active_path = model_path.join(active_quant.filename);
-            if active_path.exists() {
+            if is_cached_quant_valid(&active_path, active_quant.size_bytes) {
                 (configured_model, active_quant)
             } else {
-                find_installed_quant(&model_path, configured_model)
+                select_cached_quant_for_hardware(&model_path, configured_model, &hw)
                     .map(|q| (configured_model, q))
                     .or_else(|| find_any_installed_model_quant(&model_path))
-                    .ok_or_else(|| anyhow::anyhow!("No model installed"))?
+                    .ok_or_else(no_model_error)?
             }
         } else {
-            find_installed_quant(&model_path, configured_model)
+            select_cached_quant_for_hardware(&model_path, configured_model, &hw)
                 .map(|q| (configured_model, q))
                 .or_else(|| find_any_installed_model_quant(&model_path))
-                .ok_or_else(|| anyhow::anyhow!("No model installed"))?
+                .ok_or_else(no_model_error)?
         }
     } else {
-        find_installed_quant(&model_path, configured_model)
+        select_cached_quant_for_hardware(&model_path, configured_model, &hw)
             .map(|q| (configured_model, q))
             .or_else(|| find_any_installed_model_quant(&model_path))
-            .ok_or_else(|| anyhow::anyhow!("No model installed"))?
+            .ok_or_else(no_model_error)?
     };
 
     let model_file = model_path.join(quant.filename);
-    let hw = HardwareInfo::detect();
-    let memory_mb = hw.vram_mb.unwrap_or(hw.ram_mb);
+    let memory_mb = hw.vram_mb.map(|vram| vram.min(hw.ram_mb)).unwrap_or(hw.ram_mb);
     let runtime_limits = recommend_runtime_limits(memory_mb, model, true);
+    let inference_tuning = recommend_inference_tuning(&hw, quant);
 
     let mut runtime_config = config.clone();
-    if agent_policy.auto_approve {
-        runtime_config.auto_approve = true;
-    }
     runtime_config.model.context_size = Some(
         runtime_config
             .model
@@ -549,6 +651,31 @@ async fn run_prompt(
             .min(model.max_context_size)
             .max(8_192),
     );
+    if runtime_config.model.n_gpu_layers < 0 {
+        runtime_config.model.n_gpu_layers = inference_tuning.n_gpu_layers;
+    }
+    if runtime_config.model.kv_cache_type_k.is_none() {
+        runtime_config.model.kv_cache_type_k = Some(inference_tuning.kv_cache_type_k.to_string());
+    }
+    if runtime_config.model.kv_cache_type_v.is_none() {
+        runtime_config.model.kv_cache_type_v = Some(inference_tuning.kv_cache_type_v.to_string());
+    }
+    if runtime_config.model.n_batch.is_none() {
+        runtime_config.model.n_batch = Some(inference_tuning.n_batch);
+    }
+    if runtime_config.model.flash_attention.is_none() {
+        runtime_config.model.flash_attention = Some(inference_tuning.flash_attention);
+    }
+    if runtime_config.model.n_threads.is_none() && inference_tuning.n_threads > 0 {
+        runtime_config.model.n_threads = Some(inference_tuning.n_threads);
+    }
+
+    // Cap context_size to what actually fits in VRAM/RAM.
+    let tuned_ctx = runtime_config.model.context_size.unwrap_or(8_192);
+    if tuned_ctx > inference_tuning.context_size_cap && inference_tuning.context_size_cap >= 2_048 {
+        runtime_config.model.context_size = Some(inference_tuning.context_size_cap);
+    }
+
     if let Some(ctk) = ctk_override {
         runtime_config.model.kv_cache_type_k = Some(ctk);
     }
@@ -556,11 +683,19 @@ async fn run_prompt(
         runtime_config.model.kv_cache_type_v = Some(ctv);
     }
 
+    let skill_manager = SkillManager::new(&runtime_config);
+    let thinking_enabled_by_default =
+        model.supports_thinking || is_thinking_model(model.display_name, quant.name);
+
     let mut system_prompt = load_prompt(PromptFamily::Qwen3, agent_policy.prompt_variant);
-    if is_thinking_model(model.display_name, quant.name) {
+    let skills_section = skill_manager.available_skills_prompt_section();
+    if !skills_section.is_empty() {
+        system_prompt = format!("{system_prompt}\n\n{skills_section}");
+    }
+    if thinking_enabled_by_default {
         system_prompt = format!("{}\n\n{}", system_prompt, THINKING_PROMPT_BOOSTER);
     }
-    if quant.name == "Q2_K" {
+    if quant.name == "Q2_K" && thinking_enabled_by_default {
         eprintln!("Aviso: Q2_K pode não produzir resposta final em modelos 'thinking'. Considere usar 'nanocode setup' e selecionar Q4_K_M ou Q5_K_M.");
     }
 
@@ -570,8 +705,8 @@ async fn run_prompt(
         .min(runtime_limits.max_tokens)
         .clamp(512, 8192);
 
-    let tool_manager = ToolManager::new(&runtime_config);
-    tool_manager.set_enabled_tools(agent_policy.enabled_tools.clone());
+    let tool_manager = ToolManager::new(&runtime_config).await;
+    apply_agent_tool_filter(&tool_manager, &agent_policy);
     for (tool_name, permission) in &agent_policy.tool_permission_overrides {
         let _ = tool_manager.set_permission(tool_name, *permission);
     }
@@ -579,14 +714,17 @@ async fn run_prompt(
     loop_engine.set_agent_name(agent_policy.builtin.as_str());
     loop_engine.set_approval_handler(|request| {
         println!();
-        println!("Permission required for tool: {}", request.tool_name);
+        println!(
+            "Permissão necessária para a ferramenta: {}",
+            request.tool_name
+        );
         println!("call_id: {}", request.tool_call_id);
         println!(
             "{}",
             serde_json::to_string_pretty(&request.arguments)
                 .unwrap_or_else(|_| request.arguments.to_string())
         );
-        print!("Allow action? [y=once / a=always this tool (session) / n=deny]: ");
+        print!("Permitir ação? [y=uma vez / a=sempre para esta ferramenta (sessão) / n=negar]: ");
         let _ = io::stdout().flush();
 
         let mut input = String::new();
@@ -601,8 +739,78 @@ async fn run_prompt(
         }
         ApprovalDecision::Deny
     });
+    loop_engine.set_question_handler(|request| {
+        println!();
+        println!("Pergunta da ferramenta (call_id: {})", request.tool_call_id);
+        println!("{}", request.question);
+
+        if !request.choices.is_empty() {
+            for (idx, choice) in request.choices.iter().enumerate() {
+                println!("{}. {}", idx + 1, choice);
+            }
+        }
+
+        if request.allow_free_text {
+            if let Some(placeholder) = request.placeholder.as_deref() {
+                println!("(texto livre permitido: {})", placeholder);
+            } else {
+                println!("(texto livre permitido)");
+            }
+        }
+
+        print!("Resposta (Enter para cancelar): ");
+        let _ = io::stdout().flush();
+
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() {
+            return UserQuestionResponse::cancelled();
+        }
+
+        let text = input.trim().to_string();
+        if text.is_empty() {
+            return UserQuestionResponse::cancelled();
+        }
+
+        if let Ok(n) = text.parse::<usize>() {
+            if n > 0 && n <= request.choices.len() {
+                let idx = n - 1;
+                return UserQuestionResponse {
+                    answer: request.choices[idx].clone(),
+                    choice_index: Some(idx),
+                    source: QuestionAnswerSource::Choice,
+                    cancelled: false,
+                };
+            }
+        }
+
+        if let Some(idx) = request
+            .choices
+            .iter()
+            .position(|choice| choice.eq_ignore_ascii_case(&text))
+        {
+            return UserQuestionResponse {
+                answer: request.choices[idx].clone(),
+                choice_index: Some(idx),
+                source: QuestionAnswerSource::Choice,
+                cancelled: false,
+            };
+        }
+
+        if request.allow_free_text {
+            return UserQuestionResponse {
+                answer: text,
+                choice_index: None,
+                source: QuestionAnswerSource::Text,
+                cancelled: false,
+            };
+        }
+
+        UserQuestionResponse::cancelled()
+    });
+    let prompt_text = maybe_expand_skill_slash_prompt(prompt_text, &skill_manager)?;
+
     loop_engine.add_system_message(system_prompt);
-    loop_engine.add_user_message(prompt_text);
+    loop_engine.add_user_message(&prompt_text);
 
     let total_start = Instant::now();
     let mut first_token_at: Option<Instant> = None;
@@ -612,13 +820,16 @@ async fn run_prompt(
     let mut thinking_tools_gap_printed = false;
     let mut pending_tool_calls: HashMap<String, (String, Value)> = HashMap::new();
     let mut stream_sanitizer = StreamSanitizer::default();
+    if thinking_enabled_by_default {
+        stream_sanitizer.hidden = HiddenStreamState::ThinkTag;
+    }
     let mut stream_line_buf = String::new();
     let mut last_tool_call_started_at: Option<Instant> = None;
 
     let pretty_tool_name = |name: &str| -> String {
         match name {
-            "write_file" => "Write".to_string(),
-            "read_file" => "Read".to_string(),
+            "write_file" => "Escrever".to_string(),
+            "read_file" => "Ler".to_string(),
             "bash" => "Bash".to_string(),
             other => other.to_string(),
         }
@@ -658,12 +869,12 @@ async fn run_prompt(
             let path = arguments
                 .get("path")
                 .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
+                .unwrap_or("desconhecido");
             let content = arguments
                 .get("content")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            let title = format!("Create File {}", path);
+            let title = format!("Criar Arquivo {}", path);
             let width = 82usize;
             println!("{}", horizontal_rule(width));
             println!("{}", title);
@@ -681,7 +892,7 @@ async fn run_prompt(
         let max_lines = 4usize;
         let lines: Vec<&str> = result.lines().collect();
         if lines.is_empty() {
-            println!("    ⌊ (no output)");
+            println!("    ⌊ (sem saída)");
             return;
         }
         for (idx, line) in lines.iter().take(max_lines).enumerate() {
@@ -692,7 +903,7 @@ async fn run_prompt(
             }
         }
         if lines.len() > max_lines {
-            println!("      ... +{} lines", lines.len() - max_lines);
+            println!("      ... +{} linhas", lines.len() - max_lines);
         }
     };
 
@@ -769,7 +980,7 @@ async fn run_prompt(
                     if let Some((tool_name, _args)) = resolved_tool_call.as_ref() {
                         if tool_name == "read_file" {
                             let lines = line_count(&result);
-                            println!("    ⌊ Read {} Lines ({:.2}s)", lines, elapsed_s);
+                            println!("    ⌊ Leu {} linhas ({:.2}s)", lines, elapsed_s);
                             printed = true;
                         } else if tool_name == "bash" {
                             render_bash_result_preview(&result);
@@ -812,7 +1023,7 @@ async fn run_prompt(
             } => {
                 println!();
                 println!(
-                    "[compact] Triggered at {} tokens (threshold {}).",
+                    "[compact] Disparado com {} tokens (limite {}).",
                     old_context_tokens, threshold
                 );
             }
@@ -822,7 +1033,7 @@ async fn run_prompt(
                 summary_len,
             } => {
                 println!(
-                    "[compact] Completed: {} -> {} tokens (summary {} chars).",
+                    "[compact] Concluído: {} -> {} tokens (resumo com {} caracteres).",
                     old_context_tokens, new_context_tokens, summary_len
                 );
             }
@@ -901,11 +1112,11 @@ async fn run_prompt(
         Err(e) => {
             if e == "No output generated" && quant.name == "Q2_K" {
                 eprintln!(
-                    "Error: {}. A quantização Q2_K costuma degradar o raciocínio; execute 'nanocode setup' e selecione Q4_K_M ou Q5_K_M.",
+                    "Erro: {}. A quantização Q2_K costuma degradar o raciocínio; execute 'nanocode setup' e selecione Q4_K_M ou Q5_K_M.",
                     e
                 );
             } else {
-                eprintln!("Error: {}", e);
+                eprintln!("Erro: {}", e);
             }
         }
     }
@@ -919,11 +1130,11 @@ async fn run_prompt(
     let tps = stats.tokens_out as f32 / infer_elapsed;
 
     println!();
-    println!("• Model: {} ({})", model.display_name, quant.name);
-    println!("• Context Tokens: {}", stats.context_tokens);
-    println!("• Input Tokens: {}", stats.tokens_in);
-    println!("• Output Tokens: {}", stats.tokens_out);
-    println!("• Total Tokens: {}", stats.tokens_used);
+    println!("• Modelo: {} ({})", model.display_name, quant.name);
+    println!("• Tokens de contexto: {}", stats.context_tokens);
+    println!("• Tokens de entrada: {}", stats.tokens_in);
+    println!("• Tokens de saída: {}", stats.tokens_out);
+    println!("• Total de tokens: {}", stats.tokens_used);
     println!(
         "• Tempo: load={:.2}s inferência={:.2}s total={:.2}s ({:.1} tok/s)",
         first_token_at
@@ -935,4 +1146,39 @@ async fn run_prompt(
     );
 
     Ok(())
+}
+
+fn apply_agent_tool_filter(tool_manager: &ToolManager, agent_policy: &AgentPolicy) {
+    let mut enabled = agent_policy.enabled_tools.clone();
+    if matches!(
+        agent_policy.builtin,
+        BuiltinAgent::Default | BuiltinAgent::Build
+    ) {
+        for name in tool_manager.list_tool_names() {
+            if name.starts_with("mcp_") {
+                enabled.insert(name);
+            }
+        }
+    }
+    tool_manager.set_enabled_tools(enabled);
+}
+
+fn has_any_gguf_file(models_dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(models_dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .path()
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+    })
+}
+
+fn is_cached_quant_valid(path: &Path, expected_size: u64) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    is_compatible_quant_size(meta.len(), expected_size)
 }

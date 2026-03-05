@@ -26,6 +26,7 @@ indicatif = "0.17"
 
 # System info
 sysinfo = "0.32"
+num_cpus = "1"
 
 # SHA256 for verification
 sha2 = "0.10"

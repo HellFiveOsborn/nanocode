@@ -5,10 +5,9 @@ use crate::types::ToolPermission;
 use crate::types::{InvokeContext, ToolError, ToolOutput};
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::path::PathBuf;
 use tokio::fs;
 
-const MAX_FILE_SIZE: u64 = 64 * 1024; // 64KB
+const MAX_FILE_SIZE: u64 = 512 * 1024; // 512KB
 
 #[derive(Debug, Deserialize)]
 pub struct ReadFileArgs {
@@ -72,8 +71,8 @@ impl Tool for ReadFileTool {
         let args: ReadFileArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
-        // Validate path (prevent traversal)
-        let path = validate_path(&args.path)?;
+        // Validate path (prevent traversal, resolve absolute/relative)
+        let path = super::path_utils::validate_and_resolve(&args.path)?;
 
         // Check file exists
         if !path.exists() {
@@ -122,46 +121,3 @@ impl Tool for ReadFileTool {
     }
 }
 
-/// Validate path to prevent traversal attacks
-fn validate_path(path: &str) -> Result<PathBuf, ToolError> {
-    // Absolute path
-    if path.starts_with('/') {
-        return Err(ToolError::InvalidArguments(
-            "Absolute paths not allowed".to_string(),
-        ));
-    }
-
-    // Check for traversal
-    let path_buf = PathBuf::from(path);
-    let normalized = path_buf.normalize();
-
-    if normalized.to_string_lossy().contains("..") {
-        return Err(ToolError::InvalidArguments(
-            "Path traversal not allowed".to_string(),
-        ));
-    }
-
-    Ok(normalized)
-}
-
-trait Normalize {
-    fn normalize(&self) -> Self;
-}
-
-impl Normalize for PathBuf {
-    fn normalize(&self) -> Self {
-        let mut result = Self::new();
-        for component in self.components() {
-            match component {
-                std::path::Component::ParentDir => {
-                    result.pop();
-                }
-                std::path::Component::Normal(name) => {
-                    result.push(name);
-                }
-                _ => {}
-            }
-        }
-        result
-    }
-}

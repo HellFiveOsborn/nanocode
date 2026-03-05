@@ -32,6 +32,7 @@ pub struct ModelSpec {
     pub recommended_context_general: u32,
     /// Recommended context for coding / harder reasoning tasks
     pub recommended_context_coding: u32,
+    /// Static quantizations. Leave empty when variants are discovered dynamically.
     pub quantizations: &'static [QuantizationVariant],
 }
 
@@ -193,8 +194,22 @@ pub const QWEN3_4B_THINKING: ModelSpec = ModelSpec {
     quantizations: QWEN3_4B_QUANTIZATIONS,
 };
 
+/// Qwen3.5 4B model family.
+pub const QWEN3_5_4B: ModelSpec = ModelSpec {
+    id: "qwen3.5-4b",
+    display_name: "Qwen3.5 4B",
+    hf_repo: "unsloth/Qwen3.5-4B-GGUF",
+    category: ModelCategory::Instruct,
+    supports_thinking: true,
+    supports_vision: true,
+    max_context_size: 131_072,
+    recommended_context_general: 32_768,
+    recommended_context_coding: 131_072,
+    quantizations: &[],
+};
+
 /// All models currently supported by Nano Code.
-pub const MODELS: &[ModelSpec] = &[QWEN3_4B_THINKING];
+pub const MODELS: &[ModelSpec] = &[QWEN3_4B_THINKING, QWEN3_5_4B];
 
 /// Default model used when config doesn't explicitly select one.
 pub fn default_model() -> &'static ModelSpec {

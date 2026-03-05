@@ -38,6 +38,9 @@ tokio-util = "0.7"
 # CLI progress UI
 indicatif = "0.17"
 syntect = "5"
+arboard = "3.4"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 tokio.workspace = true

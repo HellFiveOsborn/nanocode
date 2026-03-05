@@ -1,6 +1,7 @@
 //! Hardware detection
 
 use crate::catalog::ModelSpec;
+use crate::quant_catalog::model_quantizations;
 use crate::quantization::QuantizationVariant;
 use serde::{Deserialize, Serialize};
 use sysinfo::System;
@@ -42,6 +43,22 @@ pub struct HardwareInfo {
     pub gpu_vendor: Option<GpuVendor>,
     pub has_cuda: bool,
     pub has_metal: bool,
+}
+
+/// Runtime tuning recommendations derived from detected hardware + selected quantization.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct InferenceTuning {
+    pub n_gpu_layers: i32,
+    pub kv_cache_type_k: &'static str,
+    pub kv_cache_type_v: &'static str,
+    /// Recommended n_batch for prompt processing (higher = faster on GPU).
+    pub n_batch: u32,
+    /// Maximum context size that fits in available memory with this config.
+    pub context_size_cap: u32,
+    /// Whether flash attention should be enabled.
+    pub flash_attention: bool,
+    /// Number of threads for inference (0 = auto/default).
+    pub n_threads: u32,
 }
 
 impl HardwareInfo {
@@ -285,9 +302,196 @@ pub fn recommend(hw: &HardwareInfo, model: &ModelSpec) -> Option<&'static Quanti
         "Q2_K"
     };
 
-    model
-        .quantizations
+    model_quantizations(model)
         .iter()
         .find(|q| q.name == recommended)
-        .or_else(|| model.quantizations.first())
+        .or_else(|| model_quantizations(model).first())
+}
+
+/// Recommend inference/runtime tuning parameters for the selected quantization.
+///
+/// Policy:
+/// - Budget-based: compute whether model + KV cache + overhead fit in VRAM.
+/// - Full GPU offload whenever possible (dramatically faster than CPU).
+/// - Flash attention enabled when CUDA/Metal available (saves KV cache VRAM).
+/// - KV cache type chosen to maximize context that fits in remaining VRAM.
+/// - n_batch tuned for GPU throughput (larger = faster prompt processing).
+/// - Thread count optimized for physical cores.
+pub fn recommend_inference_tuning(
+    hw: &HardwareInfo,
+    quant: &QuantizationVariant,
+) -> InferenceTuning {
+    const MB: u64 = 1024 * 1024;
+    let quant_mb = (quant.size_bytes / MB).max(1);
+    let has_accelerator = hw.has_cuda || hw.has_metal || hw.gpu_vendor.is_some();
+
+    let n_threads = optimal_thread_count();
+
+    // --- CPU-only path ---
+    if !has_accelerator {
+        let free_ram = hw.ram_mb.saturating_sub(quant_mb).saturating_sub(512);
+        let (kv_k, kv_v, ctx_cap) = if free_ram >= 8_000 {
+            ("q8_0", "q8_0", 16_384u32)
+        } else if free_ram >= 4_000 {
+            ("q4_0", "q4_0", 8_192)
+        } else if free_ram >= 2_000 {
+            ("q4_0", "q4_0", 4_096)
+        } else {
+            ("q4_0", "q4_0", 2_048)
+        };
+        return InferenceTuning {
+            n_gpu_layers: 0,
+            kv_cache_type_k: kv_k,
+            kv_cache_type_v: kv_v,
+            n_batch: 512,
+            context_size_cap: ctx_cap,
+            flash_attention: false,
+            n_threads,
+        };
+    }
+
+    // --- GPU path ---
+    let is_metal = hw.has_metal || matches!(hw.gpu_vendor, Some(GpuVendor::Apple));
+
+    let effective_vram_mb = hw.vram_mb.unwrap_or_else(|| {
+        if is_metal {
+            // Unified memory: ~60% usable for ML after OS/UI.
+            hw.ram_mb.saturating_mul(60) / 100
+        } else {
+            // Fallback when VRAM unknown but GPU detected: conservative estimate.
+            hw.ram_mb.saturating_mul(30) / 100
+        }
+    });
+
+    // CUDA/Metal runtime overhead: ~200-400 MB depending on driver/framework.
+    let runtime_overhead_mb: u64 = if is_metal { 256 } else { 350 };
+
+    // Available VRAM after loading model weights entirely on GPU.
+    let vram_after_model = effective_vram_mb
+        .saturating_sub(quant_mb)
+        .saturating_sub(runtime_overhead_mb);
+
+    // --- Estimate KV cache VRAM per 1K context tokens ---
+    // Rough formula for a 4B-class model (28-36 layers, d=2560):
+    //   Per token per KV pair (F16): ~2 * n_layers * d_model * 2 bytes
+    //   For 32 layers, d=2560: ~327,680 bytes/token ≈ 0.31 MB/token
+    //   Q8_0 ≈ 50% of F16, Q4_0 ≈ 25% of F16
+    // Per 1K tokens:
+    //   F16: ~312 MB, Q8_0: ~156 MB, Q4_0: ~78 MB
+    // With flash attention: KV cache is ~30% smaller in practice.
+    const KV_PER_1K_Q8_MB: u64 = 156;
+    const KV_PER_1K_Q4_MB: u64 = 78;
+
+    // Determine if full offload is feasible.
+    // Full offload = model fits in VRAM with room for at least minimal KV cache.
+    let min_kv_for_2k_q4 = KV_PER_1K_Q4_MB * 2; // ~156 MB for 2K context
+    let can_full_offload = vram_after_model >= min_kv_for_2k_q4;
+
+    if !can_full_offload {
+        // Model barely fits or doesn't fit — partial offload.
+        let spare_total = effective_vram_mb.saturating_sub(runtime_overhead_mb);
+        let offload_fraction = if spare_total > quant_mb {
+            // Some VRAM left for partial layers
+            let model_fraction = spare_total.saturating_sub(min_kv_for_2k_q4)
+                .saturating_mul(100)
+                / quant_mb.max(1);
+            model_fraction.min(90) as i32 // cap at 90% to leave room for KV
+        } else {
+            0
+        };
+
+        // Convert fraction to approximate layer count (assume ~32 layers for 4B).
+        let estimated_layers = (offload_fraction.max(0) * 32) / 100;
+
+        let ctx_cap = estimate_context_cap(
+            hw.ram_mb.saturating_sub(quant_mb / 2),
+            KV_PER_1K_Q4_MB,
+            false,
+        );
+
+        return InferenceTuning {
+            n_gpu_layers: estimated_layers,
+            kv_cache_type_k: "q4_0",
+            kv_cache_type_v: "q4_0",
+            n_batch: if estimated_layers > 0 { 1024 } else { 512 },
+            context_size_cap: ctx_cap,
+            flash_attention: estimated_layers > 0,
+            n_threads,
+        };
+    }
+
+    // Full offload is feasible. Now optimize KV cache type and context cap.
+    let flash_attn = true; // Always enable when GPU available.
+    let flash_savings = 70; // flash attn effective KV = ~70% of normal
+
+    // Try Q8_0 KV first (better quality), then Q4_0 if needed.
+    let kv_per_1k_q8_effective = KV_PER_1K_Q8_MB * flash_savings / 100;
+    let kv_per_1k_q4_effective = KV_PER_1K_Q4_MB * flash_savings / 100;
+
+    // Mixed Q8_K+Q4_V has effective per-1K ≈ average of q8 and q4.
+    let kv_per_1k_mixed_effective = (kv_per_1k_q8_effective + kv_per_1k_q4_effective) / 2;
+
+    let (kv_k, kv_v, ctx_cap) = if vram_after_model >= KV_PER_1K_Q8_MB * 16 {
+        // Lots of room: Q8_0 KV, large context.
+        let cap = estimate_context_cap(vram_after_model, kv_per_1k_q8_effective, true);
+        ("q8_0", "q8_0", cap)
+    } else if vram_after_model >= KV_PER_1K_Q8_MB * 4 {
+        // Moderate room: mixed Q8_K/Q4_V for better quality with reasonable context.
+        let cap = estimate_context_cap(vram_after_model, kv_per_1k_mixed_effective, true);
+        ("q8_0", "q4_0", cap)
+    } else {
+        // Tight: Q4_0 KV to maximize context.
+        let cap = estimate_context_cap(vram_after_model, kv_per_1k_q4_effective, true);
+        ("q4_0", "q4_0", cap)
+    };
+
+    // GPU batch: larger = faster prompt ingestion. 2048 is good for modern GPUs.
+    let n_batch = if effective_vram_mb >= 8_000 { 2048 } else { 1024 };
+
+    InferenceTuning {
+        n_gpu_layers: -1,
+        kv_cache_type_k: kv_k,
+        kv_cache_type_v: kv_v,
+        n_batch,
+        context_size_cap: ctx_cap,
+        flash_attention: flash_attn,
+        n_threads,
+    }
+}
+
+/// Estimate the maximum context tokens that fit in available memory.
+fn estimate_context_cap(available_mb: u64, kv_per_1k_mb: u64, is_gpu: bool) -> u32 {
+    if kv_per_1k_mb == 0 {
+        return 8_192;
+    }
+    // Leave 10% margin for fragmentation / allocator overhead.
+    let usable = available_mb * 90 / 100;
+    let max_1k_blocks = usable / kv_per_1k_mb.max(1);
+    let raw = (max_1k_blocks * 1024) as u32;
+    // Round down to nearest 1024 and clamp to sensible range.
+    let rounded = (raw / 1024) * 1024;
+    if is_gpu {
+        rounded.clamp(2_048, 131_072)
+    } else {
+        rounded.clamp(2_048, 65_536)
+    }
+}
+
+/// Determine optimal thread count (physical cores, not hyperthreads).
+fn optimal_thread_count() -> u32 {
+    // num_cpus::get_physical() returns physical core count when available.
+    let physical = num_cpus::get_physical();
+    let logical = num_cpus::get();
+
+    // Use physical cores for inference (hyperthreads hurt llama.cpp perf).
+    // If physical == logical, we're probably on a non-HT system or detection failed.
+    let cores = if physical > 0 && physical <= logical {
+        physical
+    } else {
+        // Fallback: use half of logical as a reasonable guess.
+        (logical / 2).max(1)
+    };
+
+    // Cap at reasonable max to avoid contention on many-core systems.
+    (cores as u32).min(16)
 }

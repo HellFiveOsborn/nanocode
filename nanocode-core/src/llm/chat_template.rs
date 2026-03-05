@@ -98,7 +98,7 @@ impl ChatTemplateRenderer {
         if let Some(msg) = messages.first() {
             if msg.role == crate::types::MessageRole::System {
                 output.push_str("<|im_start|>system\n");
-                output.push_str(&msg.content);
+                output.push_str(&msg.content.to_plain_text_lossy());
                 output.push_str("\n<|im_end|>\n");
             }
         }
@@ -116,7 +116,7 @@ impl ChatTemplateRenderer {
             },
         ) {
             output.push_str(&format!("<|im_start|>{}\n", msg.role));
-            output.push_str(&msg.content);
+            output.push_str(&msg.content.to_plain_text_lossy());
 
             if let Some(tool_calls) = &msg.tool_calls {
                 for tc in tool_calls {

@@ -15,6 +15,7 @@ anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 toml.workspace = true
 chrono.workspace = true
 uuid.workspace = true
@@ -28,6 +29,7 @@ regex = "1"
 
 # Llama.cpp bindings usando libs do sistema (llama/ggml já compiladas com CUDA)
 llama-cpp-2 = { version = "0.1", features = ["system-ggml"] }
+llama-cpp-sys-2 = { version = "0.1", features = ["system-ggml"] }
 
 # Async channels
 flume = "0.11"

@@ -195,7 +195,7 @@ impl PlanAgentMiddleware {
         Self {
             was_plan_agent: false,
             reminder_message: "[system] Plan mode active: do not execute mutating tools or edit files until the user asks to execute.".to_string(),
-            exit_message: "[system] Plan mode ended: execution tools are available again.".to_string(),
+            exit_message: "[system] Plan mode ended. To implement, switch to Build (Tab or /agent build).".to_string(),
         }
     }
 

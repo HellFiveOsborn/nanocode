@@ -1,6 +1,7 @@
 //! LLM inference module using embedded llama.cpp (llama-cpp-2)
 
 use crate::config::NcConfig;
+use crate::interrupt::user_interrupted_error;
 use crate::types::LlmMessage;
 use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -51,31 +52,37 @@ impl LlmEngine {
             LlamaBackend::init().map_err(|e| format!("llama backend init failed: {e}"))?;
         backend.void_logs();
 
-        let wants_gpu_layers = if self.config.model.n_gpu_layers < 0 {
+        let auto_gpu_layers = self.config.model.n_gpu_layers < 0;
+        let wants_gpu_layers = if auto_gpu_layers {
             u32::MAX
         } else {
             self.config.model.n_gpu_layers as u32
         };
 
-        if wants_gpu_layers > 0 && !backend.supports_gpu_offload() {
-            return Err("GPU offload indisponível. Verifique se as libs do sistema (libllama/libggml) foram compiladas com backend CUDA e se o driver NVIDIA está ativo.".to_string());
-        }
-
         let n_gpu_layers = if backend.supports_gpu_offload() {
             wants_gpu_layers
         } else {
+            if wants_gpu_layers > 0 {
+                eprintln!(
+                    "Aviso: backend atual sem GPU offload. Executando em CPU-only (n_gpu_layers=0)."
+                );
+            }
             0
         };
 
-        let model_params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);
-        let model = LlamaModel::load_from_file(&backend, &self.model_path, &model_params)
-            .map_err(|e| format!("failed to load model '{}': {e}", self.model_path.display()))?;
+        let model = load_model_with_fallback(&backend, &self.model_path, n_gpu_layers, auto_gpu_layers)
+            .map_err(|err| {
+                format!(
+                    "failed to load model '{}': {err}",
+                    self.model_path.display()
+                )
+            })?;
 
         let ctx_size = self
             .config
             .model
             .context_size
-            .unwrap_or(32_768)
+            .unwrap_or(8_192)
             .clamp(512, 262_144);
 
         let tools_json_owned = tools.as_ref().map(|v| v.to_string());
@@ -114,49 +121,104 @@ impl LlmEngine {
             ));
         }
 
-        let n_batch = (tokens.len() as u32).max(1);
-        let ctx_params = LlamaContextParams::default()
-            .with_n_threads(num_cpus::get() as i32)
-            .with_n_threads_batch((num_cpus::get() as i32).max(1))
-            .with_n_batch(n_batch)
-            .with_n_ctx(Some(NonZeroU32::new(ctx_size).expect("ctx_size > 0")));
-        let ctx_params = if let Some(k_type) = self
+        let requested_k_type = self
             .config
             .model
             .kv_cache_type_k
             .as_deref()
-            .and_then(parse_kv_cache_type)
-        {
-            ctx_params.with_type_k(k_type)
-        } else {
-            ctx_params
-        };
-        let ctx_params = if let Some(v_type) = self
+            .and_then(parse_kv_cache_type);
+        let requested_v_type = self
             .config
             .model
             .kv_cache_type_v
             .as_deref()
-            .and_then(parse_kv_cache_type)
-        {
-            ctx_params.with_type_v(v_type)
-        } else {
-            ctx_params
-        };
+            .and_then(parse_kv_cache_type);
 
-        let mut ctx = model
-            .new_context(&backend, ctx_params)
-            .map_err(|e| format!("failed to create llama context: {e}"))?;
+        let n_threads = self.config.model.n_threads.unwrap_or(0);
+        let flash_attention = self.config.model.flash_attention.unwrap_or(false);
 
-        let mut batch = LlamaBatch::new(tokens.len(), 1);
-        for (i, token) in tokens.iter().enumerate() {
-            let is_last = i == tokens.len() - 1;
-            batch
-                .add(*token, i as i32, &[0], is_last)
-                .map_err(|e| format!("failed to add token to prompt batch: {e}"))?;
+        let config_n_batch = self.config.model.n_batch.unwrap_or(0);
+        let context_candidates =
+            build_context_candidates(ctx_size, tokens.len() as u32, requested_k_type, requested_v_type, config_n_batch);
+        let mut context_errors = Vec::new();
+        let mut used_fallback = false;
+        let mut used_candidate = context_candidates[0];
+        let mut ctx: Option<_> = None;
+
+        for (idx, candidate) in context_candidates.iter().copied().enumerate() {
+            let thread_count = if n_threads > 0 { n_threads as i32 } else { num_cpus::get_physical().max(1) as i32 };
+            let batch_threads = if n_threads > 0 { n_threads as i32 } else { num_cpus::get().max(1) as i32 };
+            let mut ctx_params = LlamaContextParams::default()
+                .with_n_threads(thread_count)
+                .with_n_threads_batch(batch_threads)
+                .with_n_batch(candidate.n_batch)
+                .with_n_ctx(Some(NonZeroU32::new(candidate.ctx_size).expect("ctx_size > 0")));
+            if let Some(k_type) = candidate.k_type {
+                ctx_params = ctx_params.with_type_k(k_type);
+            }
+            if let Some(v_type) = candidate.v_type {
+                ctx_params = ctx_params.with_type_v(v_type);
+            }
+            if flash_attention {
+                ctx_params = ctx_params.with_flash_attention_policy(
+                    llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_ENABLED,
+                );
+            }
+
+            match model.new_context(&backend, ctx_params) {
+                Ok(created_ctx) => {
+                    used_fallback = idx > 0;
+                    used_candidate = candidate;
+                    ctx = Some(created_ctx);
+                    break;
+                }
+                Err(err) => context_errors.push(format!(
+                    "{} -> {}",
+                    candidate.describe(),
+                    err
+                )),
+            }
         }
 
-        ctx.decode(&mut batch)
-            .map_err(|e| format!("failed to decode prompt: {e}"))?;
+        let mut ctx = ctx.ok_or_else(|| {
+            format!(
+                "failed to create llama context after {} attempts: {}",
+                context_errors.len(),
+                context_errors.join(" | ")
+            )
+        })?;
+        if used_fallback {
+            eprintln!(
+                "Aviso: fallback de contexto aplicado ({})",
+                used_candidate.describe()
+            );
+        }
+
+        let prompt_batch_capacity = used_candidate.n_batch.max(1) as usize;
+        let mut batch = LlamaBatch::new(prompt_batch_capacity, 1);
+        let mut prompt_pos = 0usize;
+        while prompt_pos < tokens.len() {
+            // Check for interrupt between prompt batches (allows ESC to cancel quickly).
+            if let Some(callback) = on_chunk.as_deref_mut() {
+                if !callback("") {
+                    return Err(user_interrupted_error());
+                }
+            }
+
+            batch.clear();
+            let chunk_end = (prompt_pos + prompt_batch_capacity).min(tokens.len());
+            for (local_idx, token) in tokens[prompt_pos..chunk_end].iter().enumerate() {
+                let global_pos = prompt_pos + local_idx;
+                let is_last = global_pos + 1 == tokens.len();
+                batch
+                    .add(*token, global_pos as i32, &[0], is_last)
+                    .map_err(|e| format!("failed to add token to prompt batch: {e}"))?;
+            }
+
+            ctx.decode(&mut batch)
+                .map_err(|e| format!("failed to decode prompt: {e}"))?;
+            prompt_pos = chunk_end;
+        }
 
         let top_k = self.config.model.top_k.clamp(1, 200) as i32;
         let top_p = self.config.model.top_p.clamp(0.1, 1.0);
@@ -186,6 +248,11 @@ impl LlmEngine {
         let mut decoder = encoding_rs::UTF_8.new_decoder();
 
         for _ in 0..max_tokens {
+            if let Some(callback) = on_chunk.as_deref_mut() {
+                if !callback("") {
+                    return Err(user_interrupted_error());
+                }
+            }
             let token = sampler.sample(&ctx, batch.n_tokens() - 1);
             sampler.accept(token);
 
@@ -199,7 +266,7 @@ impl LlmEngine {
             result.push_str(&piece);
             if let Some(callback) = on_chunk.as_deref_mut() {
                 if !callback(&piece) {
-                    return Err("Generation interrupted by user".to_string());
+                    return Err(user_interrupted_error());
                 }
             }
 
@@ -221,8 +288,8 @@ impl LlmEngine {
                     }
                 }
 
-                if let Some(content) = value.get("content").and_then(|c| c.as_str()) {
-                    let cleaned = extract_final_answer(content);
+                if let Some(content) = extract_response_content_text(value.get("content")) {
+                    let cleaned = extract_final_answer(&content);
                     let content = cleaned.trim();
                     if !content.is_empty() {
                         return Ok(content.to_string());
@@ -295,12 +362,12 @@ impl LlmEngine {
             tool_choice: tool_choice_json,
             json_schema: None,
             grammar: tool_grammar,
-            reasoning_format: Some("none"),
-            chat_template_kwargs: Some("{\"enable_thinking\":false}"),
+            reasoning_format: None,
+            chat_template_kwargs: Some("{\"enable_thinking\":true}"),
             add_generation_prompt: true,
             use_jinja: true,
             parallel_tool_calls: false,
-            enable_thinking: false,
+            enable_thinking: true,
             add_bos: false,
             add_eos: false,
             parse_tool_calls: true,
@@ -310,6 +377,210 @@ impl LlmEngine {
             .apply_chat_template_oaicompat(&template, &params)
             .map_err(|e| format!("failed to apply chat template (oaicompat): {e}"))
     }
+}
+
+fn extract_response_content_text(content: Option<&Value>) -> Option<String> {
+    let content = content?;
+    match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) => {
+            let mut out = String::new();
+            for part in parts {
+                let is_text = part
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(|t| t == "text")
+                    .unwrap_or(false);
+                if !is_text {
+                    continue;
+                }
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(text);
+                }
+            }
+            if out.is_empty() {
+                None
+            } else {
+                Some(out)
+            }
+        }
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ContextCandidate {
+    ctx_size: u32,
+    n_batch: u32,
+    k_type: Option<KvCacheType>,
+    v_type: Option<KvCacheType>,
+}
+
+impl ContextCandidate {
+    fn describe(&self) -> String {
+        format!(
+            "n_ctx={}, n_batch={}, kv_k={:?}, kv_v={:?}",
+            self.ctx_size, self.n_batch, self.k_type, self.v_type
+        )
+    }
+}
+
+fn build_context_candidates(
+    requested_ctx_size: u32,
+    prompt_tokens: u32,
+    requested_k_type: Option<KvCacheType>,
+    requested_v_type: Option<KvCacheType>,
+    config_n_batch: u32,
+) -> Vec<ContextCandidate> {
+    // Use config n_batch if set, otherwise scale based on prompt size (cap at 2048).
+    let prompt_safe_batch = if config_n_batch > 0 {
+        config_n_batch.clamp(64, 4096)
+    } else {
+        prompt_tokens.clamp(256, 2048)
+    };
+    let min_ctx = prompt_tokens.saturating_add(256).max(512);
+
+    let mut ctx_sizes = vec![requested_ctx_size, requested_ctx_size.saturating_mul(3) / 4];
+    if requested_ctx_size > 12_288 {
+        ctx_sizes.push(12_288);
+    }
+    if requested_ctx_size > 8_192 {
+        ctx_sizes.push(8_192);
+    }
+    if requested_ctx_size > 6_144 {
+        ctx_sizes.push(6_144);
+    }
+    ctx_sizes.push(4_096);
+
+    ctx_sizes.sort_unstable_by(|a, b| b.cmp(a));
+    ctx_sizes.dedup();
+
+    let mut candidates = Vec::new();
+    for ctx_size in ctx_sizes {
+        if ctx_size < min_ctx {
+            continue;
+        }
+
+        let n_batch = prompt_safe_batch.min(ctx_size);
+        candidates.push(ContextCandidate {
+            ctx_size,
+            n_batch,
+            k_type: requested_k_type,
+            v_type: requested_v_type,
+        });
+        candidates.push(ContextCandidate {
+            ctx_size,
+            n_batch,
+            k_type: Some(KvCacheType::Q4_0),
+            v_type: Some(KvCacheType::Q4_0),
+        });
+        candidates.push(ContextCandidate {
+            ctx_size,
+            n_batch,
+            k_type: None,
+            v_type: None,
+        });
+    }
+
+    if candidates.is_empty() {
+        let fallback_ctx = min_ctx.min(requested_ctx_size).max(512);
+        let n_batch = prompt_safe_batch.min(fallback_ctx);
+        candidates.push(ContextCandidate {
+            ctx_size: fallback_ctx,
+            n_batch,
+            k_type: None,
+            v_type: None,
+        });
+    }
+
+    candidates
+}
+
+fn load_model_with_fallback(
+    backend: &LlamaBackend,
+    model_path: &Path,
+    n_gpu_layers: u32,
+    auto_gpu_layers: bool,
+) -> Result<LlamaModel, String> {
+    let candidates = gpu_layer_candidates(n_gpu_layers, auto_gpu_layers);
+    let mut errors = Vec::new();
+
+    for candidate in candidates {
+        let model_params = LlamaModelParams::default().with_n_gpu_layers(candidate);
+        match LlamaModel::load_from_file(backend, model_path, &model_params) {
+            Ok(model) => {
+                if candidate != n_gpu_layers {
+                    eprintln!(
+                        "Aviso: fallback de offload aplicado (n_gpu_layers={} -> {}).",
+                        n_gpu_layers, candidate
+                    );
+                }
+                return Ok(model);
+            }
+            Err(err) => {
+                errors.push((candidate, err.to_string()));
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        return Err("no model load candidates available".to_string());
+    }
+
+    let attempts = errors
+        .iter()
+        .map(|(layers, err)| format!("n_gpu_layers={layers}: {err}"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    Err(format!(
+        "{attempts}. Se estiver usando quantizações extremas (ex: IQ3_XXS/IQ2), tente Q4_K_M ou Q5_K_M."
+    ))
+}
+
+fn gpu_layer_candidates(initial: u32, auto_gpu_layers: bool) -> Vec<u32> {
+    if initial == 0 {
+        return vec![0];
+    }
+
+    let mut candidates = Vec::new();
+    candidates.push(initial);
+
+    if auto_gpu_layers {
+        if initial == u32::MAX {
+            candidates.extend([96, 64, 48, 32, 24, 16, 8, 0]);
+        } else {
+            let mut current = initial;
+            while current > 16 {
+                current = (current.saturating_mul(3)).saturating_div(4);
+                if current > 0 {
+                    candidates.push(current);
+                } else {
+                    break;
+                }
+            }
+            candidates.extend([16, 8, 0]);
+        }
+    } else {
+        let mut current = initial;
+        while current > 16 {
+            current /= 2;
+            if current > 0 {
+                candidates.push(current);
+            } else {
+                break;
+            }
+        }
+        candidates.push(0);
+    }
+
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates.sort_unstable_by(|a, b| b.cmp(a));
+    candidates
 }
 
 fn extract_final_answer(text: &str) -> String {

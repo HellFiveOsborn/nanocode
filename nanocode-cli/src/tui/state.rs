@@ -1,7 +1,10 @@
 use nanocode_core::agents::BuiltinAgent;
+use nanocode_core::session::SessionInfo;
 use nanocode_core::AgentStats;
 use nanocode_core::ApprovalDecision;
+use nanocode_core::UserQuestionResponse;
 use nanocode_hf::RuntimeTelemetry;
+use std::collections::BTreeMap;
 use std::sync::mpsc::SyncSender;
 use std::time::Instant;
 
@@ -10,6 +13,24 @@ pub enum ToolState {
     Running,
     Ok,
     Error,
+}
+
+#[derive(Clone)]
+pub struct SubToolEntry {
+    pub summary: String,
+    pub done: bool,
+}
+
+#[derive(Clone, Default)]
+pub struct SubagentTracking {
+    /// Sub-tool calls made by the subagent (newest last).
+    pub sub_tools: Vec<SubToolEntry>,
+    /// Total tool uses completed.
+    pub tools_done: u32,
+    /// Start time for elapsed calculation.
+    pub started_at: Option<Instant>,
+    /// Final stats (set when subagent finishes).
+    pub final_tools_called: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -22,10 +43,15 @@ pub enum ChatItem {
     },
     Assistant(String),
     Tool {
+        tool_name: String,
         summary: String,
         stream: Option<String>,
-        detail: Option<String>,
+        output: Option<String>,
+        code_path: Option<String>,
+        code: Option<String>,
+        diff: Option<String>,
         state: ToolState,
+        subagent: Option<SubagentTracking>,
     },
     Error(String),
 }
@@ -44,10 +70,19 @@ pub enum InputMode {
     Slash,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct SlashCommandEntry {
-    pub alias: &'static str,
-    pub description: &'static str,
+    pub alias: String,
+    pub description: String,
+    pub is_skill: bool,
+}
+
+#[derive(Clone)]
+pub struct SkillEntry {
+    pub name: String,
+    pub description: String,
+    pub skill_path: String,
+    pub user_invocable: bool,
 }
 
 pub struct SetupChoice {
@@ -151,11 +186,58 @@ impl ConfigScreenState {
 }
 
 pub struct PendingApproval {
-    pub call_id: String,
     pub summary: String,
-    pub arguments: String,
+    pub details: Vec<String>,
+    pub diff_preview: Option<String>,
     pub decision_tx: SyncSender<ApprovalDecision>,
     pub selected_option: ApprovalOption,
+}
+
+pub struct PendingPlanReview {
+    pub selected_option: PlanReviewOption,
+    pub plan_text: String,
+}
+
+pub struct PendingUserQuestion {
+    pub question: String,
+    pub choices: Vec<String>,
+    pub allow_free_text: bool,
+    pub placeholder: Option<String>,
+    pub selected_choice: usize,
+    pub text_input: String,
+    pub response_tx: SyncSender<UserQuestionResponse>,
+}
+
+pub struct PendingResumeSelection {
+    pub sessions: Vec<SessionInfo>,
+    pub selected_idx: usize,
+}
+
+pub struct SessionResumeRequest {
+    pub session_id_query: String,
+}
+
+pub struct AgentSwitchRequest {
+    pub target: BuiltinAgent,
+    pub bootstrap_prompt: Option<String>,
+}
+
+pub struct PendingTextPaste {
+    pub token: String,
+    pub full_text: String,
+}
+
+pub struct PendingImagePaste {
+    pub token: String,
+    pub data_url: String,
+}
+
+#[derive(Clone)]
+pub struct MentionSuggestionEntry {
+    pub replacement: String,
+    pub display: String,
+    pub description: String,
+    pub is_directory: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -191,6 +273,31 @@ impl ApprovalOption {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PlanReviewOption {
+    ApproveAndBuild,
+    Disapprove,
+    ReworkWithSuggestion,
+}
+
+impl PlanReviewOption {
+    pub fn next(self) -> Self {
+        match self {
+            Self::ApproveAndBuild => Self::Disapprove,
+            Self::Disapprove => Self::ReworkWithSuggestion,
+            Self::ReworkWithSuggestion => Self::ApproveAndBuild,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::ApproveAndBuild => Self::ReworkWithSuggestion,
+            Self::Disapprove => Self::ApproveAndBuild,
+            Self::ReworkWithSuggestion => Self::Disapprove,
+        }
+    }
+}
+
 pub struct AppState {
     pub screen: UiScreen,
     pub needs_model_setup: bool,
@@ -198,10 +305,23 @@ pub struct AppState {
     pub model_setup_can_cancel: bool,
     pub open_settings_requested: bool,
     pub open_model_setup_requested: bool,
+    pub compact_requested: bool,
+    pub reload_requested: bool,
     pub input_mode: InputMode,
     pub input: String,
+    pub supports_thinking: bool,
+    pub supports_vision: bool,
+    pub pending_text_pastes: Vec<PendingTextPaste>,
+    pub pending_image_pastes: Vec<PendingImagePaste>,
+    pub paste_sequence: u32,
+    pub skills: BTreeMap<String, SkillEntry>,
+    pub skills_count: usize,
+    pub mcp_servers_count: usize,
     pub slash_suggestions: Vec<SlashCommandEntry>,
     pub slash_selected: usize,
+    pub mention_suggestions: Vec<MentionSuggestionEntry>,
+    pub mention_selected: usize,
+    pub mention_replace_range: Option<(usize, usize)>,
     pub model_setup: Option<ModelSetupState>,
     pub config_screen: Option<ConfigScreenState>,
     pub chat: Vec<ChatItem>,
@@ -212,14 +332,20 @@ pub struct AppState {
     pub busy: bool,
     pub tools_collapsed: bool,
     pub thinking_collapsed: bool,
-    pub slash_details_expanded: bool,
+    pub code_blocks_collapsed: bool,
     pub chat_scroll: u16,
     pub spinner_idx: usize,
     pub stream_idx: Option<usize>,
     pub thinking_idx: Option<usize>,
     pub pending_approval: Option<PendingApproval>,
+    pub pending_user_question: Option<PendingUserQuestion>,
+    pub pending_plan_review: Option<PendingPlanReview>,
+    pub pending_resume_selection: Option<PendingResumeSelection>,
     pub active_agent: BuiltinAgent,
-    pub requested_agent_switch: Option<BuiltinAgent>,
+    pub yolo_mode: bool,
+    pub requested_agent_switch: Option<AgentSwitchRequest>,
+    pub requested_resume_session: Option<SessionResumeRequest>,
+    pub current_session_id: Option<String>,
     pub busy_started_at: Option<Instant>,
     pub stats: AgentStats,
 }
@@ -237,28 +363,47 @@ impl AppState {
             model_setup_can_cancel: false,
             open_settings_requested: false,
             open_model_setup_requested: false,
+            compact_requested: false,
+            reload_requested: false,
             input_mode: InputMode::Default,
             input: String::new(),
+            supports_thinking: false,
+            supports_vision: false,
+            pending_text_pastes: Vec::new(),
+            pending_image_pastes: Vec::new(),
+            paste_sequence: 0,
+            skills: BTreeMap::new(),
+            skills_count: 0,
+            mcp_servers_count: 0,
             slash_suggestions: Vec::new(),
             slash_selected: 0,
+            mention_suggestions: Vec::new(),
+            mention_selected: 0,
+            mention_replace_range: None,
             model_setup: None,
             config_screen: None,
             chat: vec![ChatItem::Banner],
-            status: "initializing model...".to_string(),
-            model_label: "loading".to_string(),
+            status: "inicializando modelo...".to_string(),
+            model_label: "carregando".to_string(),
             telemetry,
             max_context_tokens,
             busy: true,
-            tools_collapsed: true,
+            tools_collapsed: false,
             thinking_collapsed: true,
-            slash_details_expanded: false,
+            code_blocks_collapsed: false,
             chat_scroll: 0,
             spinner_idx: 0,
             stream_idx: None,
             thinking_idx: None,
             pending_approval: None,
+            pending_user_question: None,
+            pending_plan_review: None,
+            pending_resume_selection: None,
             active_agent,
+            yolo_mode: false,
             requested_agent_switch: None,
+            requested_resume_session: None,
+            current_session_id: None,
             busy_started_at: Some(Instant::now()),
             stats: AgentStats::default(),
         }

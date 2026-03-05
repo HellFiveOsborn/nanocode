@@ -1,6 +1,8 @@
 //! Model registry
 
 use crate::catalog::{models, ModelSpec};
+use crate::hardware::{recommend, HardwareInfo};
+use crate::quant_catalog::model_quantizations;
 use crate::quantization::is_compatible_quant_size;
 use crate::quantization::QuantizationVariant;
 use anyhow::{anyhow, Result};
@@ -19,9 +21,9 @@ pub struct RuntimeLimits {
 /// - >= 24 GB: up to 81_920
 /// - >= 16 GB: up to 65_536
 /// - >= 12 GB: up to 49_152
-/// - >= 8  GB: up to 32_768
-/// - >= 6  GB: up to 24_576
-/// - >= 4  GB: up to 16_384
+/// - >= 8  GB: up to 24_576
+/// - >= 6  GB: up to 16_384
+/// - >= 4  GB: up to 8_192
 /// - < 4  GB: up to 8_192
 pub fn recommend_runtime_limits(
     memory_mb: u64,
@@ -41,11 +43,11 @@ pub fn recommend_runtime_limits(
     } else if memory_mb >= 12_000 {
         49_152
     } else if memory_mb >= 8_000 {
-        32_768
-    } else if memory_mb >= 6_000 {
         24_576
-    } else if memory_mb >= 4_000 {
+    } else if memory_mb >= 6_000 {
         16_384
+    } else if memory_mb >= 4_000 {
+        8_192
     } else {
         8_192
     };
@@ -74,7 +76,7 @@ pub fn find_installed_quant(
     }
 
     // Check each quantization variant
-    for quant in model.quantizations {
+    for quant in model_quantizations(model) {
         let path = models_dir.join(quant.filename);
         if is_cached_quant_valid(&path, quant.size_bytes) {
             return Some(quant);
@@ -93,14 +95,44 @@ pub fn list_cached_quants(
         return Vec::new();
     }
 
-    model
-        .quantizations
+    model_quantizations(model)
         .iter()
         .filter(|quant| {
             let path = models_dir.join(quant.filename);
             is_cached_quant_valid(&path, quant.size_bytes)
         })
         .collect()
+}
+
+/// Select the best cached quantization for current hardware.
+///
+/// Selection order:
+/// 1) exact recommended quant for detected hardware;
+/// 2) cached quant closest in size to the recommendation;
+/// 3) first cached quant.
+pub fn select_cached_quant_for_hardware(
+    models_dir: &Path,
+    model: &ModelSpec,
+    hw: &HardwareInfo,
+) -> Option<&'static QuantizationVariant> {
+    let cached = list_cached_quants(models_dir, model);
+    if cached.is_empty() {
+        return None;
+    }
+
+    let target = recommend(hw, model).or_else(|| cached.first().copied())?;
+
+    if let Some(exact) = cached
+        .iter()
+        .copied()
+        .find(|q| q.name.eq_ignore_ascii_case(target.name))
+    {
+        return Some(exact);
+    }
+
+    cached
+        .into_iter()
+        .min_by_key(|q| q.size_bytes.abs_diff(target.size_bytes))
 }
 
 #[derive(Debug, Clone)]
@@ -128,7 +160,7 @@ pub fn enforce_single_quant_cache(
     }
 
     let mut removed_paths = Vec::new();
-    for quant in model.quantizations {
+    for quant in model_quantizations(model) {
         if quant.name == keep_quant_name {
             continue;
         }
@@ -149,7 +181,7 @@ pub fn enforce_single_quant_cache(
 
 /// Find a quantization by name
 pub fn find_quant_by_name(model: &ModelSpec, name: &str) -> Option<&'static QuantizationVariant> {
-    model.quantizations.iter().find(|q| q.name == name)
+    model_quantizations(model).iter().find(|q| q.name == name)
 }
 
 /// Get download URL for a quantization

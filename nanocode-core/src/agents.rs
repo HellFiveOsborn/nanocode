@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 pub enum BuiltinAgent {
     Default,
     Plan,
-    AcceptEdits,
-    AutoApprove,
+    Build,
+    Explore,
 }
 
 impl Default for BuiltinAgent {
@@ -23,34 +23,58 @@ impl Default for BuiltinAgent {
 }
 
 impl BuiltinAgent {
-    pub const ALL: [Self; 4] = [
-        Self::Default,
-        Self::Plan,
-        Self::AcceptEdits,
-        Self::AutoApprove,
-    ];
+    pub const ALL: [Self; 4] = [Self::Default, Self::Plan, Self::Build, Self::Explore];
+
+    pub const PRIMARY_CYCLE: [Self; 3] = [Self::Plan, Self::Build, Self::Default];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",
             Self::Plan => "plan",
-            Self::AcceptEdits => "accept-edits",
-            Self::AutoApprove => "auto-approve",
+            Self::Build => "build",
+            Self::Explore => "explore",
         }
     }
 
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
-            "default" => Some(Self::Default),
+            "default" | "ask" => Some(Self::Default),
             "plan" => Some(Self::Plan),
-            "accept-edits" => Some(Self::AcceptEdits),
-            "auto-approve" => Some(Self::AutoApprove),
+            "build" | "accept-edits" => Some(Self::Build),
+            "explore" => Some(Self::Explore),
             _ => None,
         }
     }
 
     pub fn available_names() -> Vec<&'static str> {
-        Self::ALL.iter().map(|agent| agent.as_str()).collect()
+        vec!["default", "plan", "build"]
+    }
+
+    pub fn primary_cycle_names() -> Vec<&'static str> {
+        Self::PRIMARY_CYCLE
+            .iter()
+            .map(|agent| agent.as_str())
+            .collect()
+    }
+
+    pub fn cycle_primary(self, reverse: bool) -> Self {
+        let current_idx = Self::PRIMARY_CYCLE
+            .iter()
+            .position(|agent| *agent == self)
+            .unwrap_or_else(|| {
+                Self::PRIMARY_CYCLE
+                    .iter()
+                    .position(|agent| *agent == Self::Default)
+                    .unwrap_or(0)
+            });
+
+        let count = Self::PRIMARY_CYCLE.len();
+        let next_idx = if reverse {
+            (current_idx + count - 1) % count
+        } else {
+            (current_idx + 1) % count
+        };
+        Self::PRIMARY_CYCLE[next_idx]
     }
 }
 
@@ -59,7 +83,6 @@ impl BuiltinAgent {
 pub struct AgentPolicy {
     pub builtin: BuiltinAgent,
     pub prompt_variant: PromptVariant,
-    pub auto_approve: bool,
     pub enabled_tools: HashSet<String>,
     pub tool_permission_overrides: HashMap<String, ToolPermission>,
 }
@@ -82,7 +105,6 @@ impl AgentPolicy {
             BuiltinAgent::Default => Self {
                 builtin: agent,
                 prompt_variant: PromptVariant::AgentDefault,
-                auto_approve: false,
                 enabled_tools: all_tools.clone(),
                 tool_permission_overrides: permission_overrides(
                     &all_tools,
@@ -93,32 +115,16 @@ impl AgentPolicy {
             BuiltinAgent::Plan => Self {
                 builtin: agent,
                 prompt_variant: PromptVariant::AgentPlan,
-                auto_approve: false,
-                enabled_tools: to_set(["read_file", "grep"]),
+                enabled_tools: to_set(["read_file", "grep", "task", "ask_user_question"]),
                 tool_permission_overrides: permission_overrides(
-                    &to_set(["read_file", "grep"]),
-                    ToolPermission::Ask,
+                    &to_set(["read_file", "grep", "task", "ask_user_question"]),
+                    ToolPermission::Always,
                     None,
                 ),
             },
-            BuiltinAgent::AcceptEdits => Self {
+            BuiltinAgent::Build => Self {
                 builtin: agent,
                 prompt_variant: PromptVariant::AgentBuild,
-                auto_approve: false,
-                enabled_tools: all_tools.clone(),
-                tool_permission_overrides: permission_overrides(
-                    &all_tools,
-                    ToolPermission::Ask,
-                    Some(vec![
-                        ("write_file".to_string(), ToolPermission::Always),
-                        ("search_replace".to_string(), ToolPermission::Always),
-                    ]),
-                ),
-            },
-            BuiltinAgent::AutoApprove => Self {
-                builtin: agent,
-                prompt_variant: PromptVariant::AgentDefault,
-                auto_approve: true,
                 enabled_tools: all_tools.clone(),
                 tool_permission_overrides: permission_overrides(
                     &all_tools,
@@ -126,12 +132,33 @@ impl AgentPolicy {
                     None,
                 ),
             },
+            BuiltinAgent::Explore => {
+                let enabled_tools = to_set(["read_file", "grep"]);
+                Self {
+                    builtin: agent,
+                    prompt_variant: PromptVariant::SubagentExplore,
+                    enabled_tools: enabled_tools.clone(),
+                    tool_permission_overrides: permission_overrides(
+                        &enabled_tools,
+                        ToolPermission::Always,
+                        None,
+                    ),
+                }
+            }
         }
     }
 }
 
 fn all_tools() -> HashSet<String> {
-    to_set(["bash", "read_file", "write_file", "grep", "search_replace"])
+    to_set([
+        "bash",
+        "read_file",
+        "write_file",
+        "grep",
+        "search_replace",
+        "task",
+        "ask_user_question",
+    ])
 }
 
 fn to_set<const N: usize>(tools: [&str; N]) -> HashSet<String> {
@@ -154,4 +181,51 @@ fn permission_overrides(
         }
     }
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BuiltinAgent;
+
+    #[test]
+    fn parse_build_alias_remains_compatible() {
+        assert_eq!(BuiltinAgent::parse("build"), Some(BuiltinAgent::Build));
+        assert_eq!(
+            BuiltinAgent::parse("accept-edits"),
+            Some(BuiltinAgent::Build)
+        );
+    }
+
+    #[test]
+    fn primary_cycle_skips_explore() {
+        // Default -> Build (forward)
+        assert_eq!(
+            BuiltinAgent::Default.cycle_primary(false),
+            BuiltinAgent::Plan
+        );
+        // Default -> Plan (reverse)
+        assert_eq!(
+            BuiltinAgent::Default.cycle_primary(true),
+            BuiltinAgent::Build
+        );
+        // Explore falls back to Default position
+        assert_eq!(
+            BuiltinAgent::Explore.cycle_primary(false),
+            BuiltinAgent::Plan
+        );
+    }
+
+    #[test]
+    fn available_names_excludes_explore() {
+        let names = BuiltinAgent::available_names();
+        assert!(!names.contains(&"explore"));
+        assert!(names.contains(&"default"));
+        assert!(names.contains(&"plan"));
+        assert!(names.contains(&"build"));
+    }
+
+    #[test]
+    fn auto_approve_alias_removed() {
+        assert_eq!(BuiltinAgent::parse("auto-approve"), None);
+    }
 }
