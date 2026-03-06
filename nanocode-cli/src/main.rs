@@ -103,7 +103,7 @@ impl Default for HiddenStreamState {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter("nanocode=info,warn")
+        .with_env_filter("nanocode=warn,warn")
         .init();
 
     let normalized_args = std::env::args().map(|arg| match arg.as_str() {
@@ -723,6 +723,8 @@ async fn run_prompt(
     }
     let mut loop_engine = AgentLoop::new(runtime_config.clone(), tool_manager);
     loop_engine.set_llm_engine(llm_engine);
+    loop_engine.set_thinking_control(model.thinking_control);
+    loop_engine.set_thinking_enabled(thinking_enabled_by_default);
     loop_engine.set_agent_name(agent_policy.builtin.as_str());
     loop_engine.set_approval_handler(|request| {
         println!();

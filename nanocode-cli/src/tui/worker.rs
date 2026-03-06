@@ -37,6 +37,7 @@ pub enum WorkerCommand {
     },
     Compact,
     SetAutoApprove(bool),
+    SetThinkingEnabled(bool),
     Shutdown,
 }
 
@@ -97,12 +98,10 @@ pub enum WorkerEvent {
     },
     CompactStart {
         old_context_tokens: u32,
-        threshold: u32,
     },
     CompactEnd {
         old_context_tokens: u32,
         new_context_tokens: u32,
-        summary_len: usize,
     },
     StoppedByMiddleware {
         reason: String,
@@ -935,11 +934,13 @@ pub fn spawn_worker(
         if !skills_section.is_empty() {
             system_prompt = format!("{system_prompt}\n\n{skills_section}");
         }
-        let thinking_enabled_by_default = runtime.model.supports_thinking
+        let mut thinking_enabled_by_default = runtime.model.supports_thinking
             || is_thinking_model(runtime.model.display_name, runtime.quant.name);
         if thinking_enabled_by_default {
             system_prompt = format!("{}\n\n{}", system_prompt, THINKING_PROMPT_BOOSTER);
         }
+        loop_engine.set_thinking_control(runtime.model.thinking_control);
+        loop_engine.set_thinking_enabled(thinking_enabled_by_default);
         loop_engine.add_system_message(system_prompt);
         if !resumed {
             if let Some(system_message) = loop_engine.messages().last() {
@@ -973,11 +974,14 @@ pub fn spawn_worker(
                 WorkerCommand::SetAutoApprove(val) => {
                     loop_engine.set_auto_approve(val);
                 }
+                WorkerCommand::SetThinkingEnabled(val) => {
+                    thinking_enabled_by_default = val;
+                    loop_engine.set_thinking_enabled(val);
+                }
                 WorkerCommand::Compact => {
                     let old_ctx = loop_engine.stats().context_tokens;
                     let _ = evt_tx.send(WorkerEvent::CompactStart {
                         old_context_tokens: old_ctx,
-                        threshold: 0,
                     });
                     match loop_engine
                         .compact(
@@ -987,12 +991,11 @@ pub fn spawn_worker(
                         )
                         .await
                     {
-                        Ok(summary) => {
+                        Ok(_summary) => {
                             let new_ctx = loop_engine.stats().context_tokens;
                             let _ = evt_tx.send(WorkerEvent::CompactEnd {
                                 old_context_tokens: old_ctx,
                                 new_context_tokens: new_ctx,
-                                summary_len: summary.len(),
                             });
                         }
                         Err(err) => {
@@ -1020,6 +1023,10 @@ pub fn spawn_worker(
                     }
                     let mut thinking_emitted_this_turn = false;
                     let mut thinking_active = thinking_enabled_by_default;
+                    // Eagerly show the Thinking block so users see feedback before first token.
+                    if thinking_active {
+                        let _ = evt_tx.send(WorkerEvent::ThinkingActive(true));
+                    }
                     let mut tool_phase_started = false;
                     let mut pending_tool_calls: HashMap<String, PendingToolCall> = HashMap::new();
 
@@ -1254,6 +1261,7 @@ pub fn spawn_worker(
                                         if thinking_enabled_by_default {
                                             stream_sanitizer.start_in_thinking();
                                             thinking_active = true;
+                                            let _ = evt_tx.send(WorkerEvent::ThinkingActive(true));
                                         }
                                     }
                                 }
@@ -1262,22 +1270,20 @@ pub fn spawn_worker(
                                 }
                                 LoopEvent::CompactStart {
                                     old_context_tokens,
-                                    threshold,
+                                    threshold: _,
                                 } => {
                                     let _ = evt_tx.send(WorkerEvent::CompactStart {
                                         old_context_tokens,
-                                        threshold,
                                     });
                                 }
                                 LoopEvent::CompactEnd {
                                     old_context_tokens,
                                     new_context_tokens,
-                                    summary_len,
+                                    summary_len: _,
                                 } => {
                                     let _ = evt_tx.send(WorkerEvent::CompactEnd {
                                         old_context_tokens,
                                         new_context_tokens,
-                                        summary_len,
                                     });
                                 }
                                 LoopEvent::StoppedByMiddleware { reason } => {

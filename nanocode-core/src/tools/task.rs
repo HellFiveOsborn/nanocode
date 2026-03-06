@@ -92,6 +92,7 @@ impl Tool for TaskTool {
         if let Some(engine) = &ctx.llm_engine {
             subloop.set_llm_engine(engine.clone());
         }
+        subloop.set_thinking_control(ctx.thinking_control);
         subloop.set_agent_name(policy.builtin.as_str());
         subloop.add_system_message(load_prompt(PromptFamily::Qwen3, policy.prompt_variant));
         subloop.add_user_message(task.to_string());
@@ -345,6 +346,7 @@ mod tests {
             runtime_model_path: Some(PathBuf::from("/tmp/from-parent.gguf")),
             llm_engine: None,
             bash_kill_signal: None,
+            thinking_control: nanocode_hf::ThinkingControl::None,
         };
 
         let (resolved_config, resolved_model) =

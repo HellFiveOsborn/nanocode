@@ -30,6 +30,32 @@ fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
         .find(&needle.to_ascii_lowercase())
 }
 
+/// Returns the byte index up to which we can safely emit visible text.
+///
+/// Instead of retaining a fixed number of trailing characters, we only retain
+/// from the last occurrence of a potential tag-start character (`<`, `[`, or
+/// newline before `<|`). This means most normal text is emitted immediately
+/// (zero latency), and we only hold back when the tail *could* be the prefix
+/// of a known marker.
+fn smart_tail_split(pending: &str, tag_starts: &[char]) -> usize {
+    // Find the last position of any tag-start char.
+    let last_start = pending.rfind(tag_starts);
+    match last_start {
+        Some(pos) => {
+            // If the potential tag prefix at `pos` is longer than any known marker
+            // (21 chars covers `<|im_start|>assistant`), it's not a real prefix — emit it all.
+            let tail_len = pending.len() - pos;
+            if tail_len > 21 {
+                pending.len()
+            } else {
+                pos
+            }
+        }
+        // No tag-start chars at all — safe to emit everything.
+        None => pending.len(),
+    }
+}
+
 fn split_keep_tail_chars(s: &str, tail_chars: usize) -> (&str, &str) {
     let total_chars = s.chars().count();
     if total_chars <= tail_chars {
@@ -71,7 +97,9 @@ impl StreamSanitizer {
         const END_TOOL_XML: &str = "</tool_call>";
         const IM_START_ASSISTANT: &str = "<|im_start|>assistant";
         const IM_END: &str = "<|im_end|>";
-        const TAIL_CHARS: usize = 24;
+
+        // Tag marker start characters (for prefix-aware tail retention).
+        const TAG_STARTS: [char; 3] = ['<', '[', '\n'];
 
         self.pending.push_str(chunk);
         let mut parts = StreamParts::default();
@@ -182,9 +210,13 @@ impl StreamSanitizer {
                         parts.visible.push_str(&self.pending);
                         self.pending.clear();
                     } else {
-                        let (emit, tail) = split_keep_tail_chars(&self.pending, TAIL_CHARS);
-                        parts.visible.push_str(emit);
-                        self.pending = tail.to_string();
+                        // Smart tail: only retain from the last potential tag-start char
+                        // instead of a fixed 24-char buffer, so tokens appear sooner.
+                        let safe_emit = smart_tail_split(&self.pending, &TAG_STARTS);
+                        if safe_emit > 0 {
+                            parts.visible.push_str(&self.pending[..safe_emit]);
+                            self.pending.drain(..safe_emit);
+                        }
                     }
                     break;
                 }

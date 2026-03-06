@@ -17,6 +17,7 @@ use crate::middleware::{
 };
 use crate::tools::ToolManager;
 use crate::types::*;
+use nanocode_hf::ThinkingControl;
 
 const DEFAULT_MAX_TURNS: u32 = 24;
 const COMPACT_SUMMARY_PROMPT: &str = r#"Create a continuation summary for this coding session.
@@ -418,6 +419,10 @@ pub struct AgentLoop {
     llm_engine: Option<Arc<LlmEngineHandle>>,
     /// Kill signal for the currently running bash process.
     bash_kill_signal: Option<crate::tools::bash::BashKillSignal>,
+    /// How the model controls thinking mode (model-family specific).
+    thinking_control: ThinkingControl,
+    /// Whether thinking is currently enabled at the model level.
+    thinking_enabled: bool,
 }
 
 impl AgentLoop {
@@ -434,6 +439,8 @@ impl AgentLoop {
             subagent_progress_tx: None,
             llm_engine: None,
             bash_kill_signal: None,
+            thinking_control: ThinkingControl::None,
+            thinking_enabled: true,
         };
         loop_state.setup_middleware();
         loop_state
@@ -452,6 +459,16 @@ impl AgentLoop {
     /// Set a shared bash kill signal used by bash tool invocations.
     pub fn set_bash_kill_signal(&mut self, signal: crate::tools::bash::BashKillSignal) {
         self.bash_kill_signal = Some(signal);
+    }
+
+    /// Set thinking control mechanism (model-family specific).
+    pub fn set_thinking_control(&mut self, control: ThinkingControl) {
+        self.thinking_control = control;
+    }
+
+    /// Toggle thinking at the model level.
+    pub fn set_thinking_enabled(&mut self, enabled: bool) {
+        self.thinking_enabled = enabled;
     }
 
     fn setup_middleware(&mut self) {
@@ -619,6 +636,8 @@ impl AgentLoop {
                 tools,
                 tool_choice,
                 interrupt_signal,
+                self.thinking_control,
+                self.thinking_enabled,
                 |_| {},
             )
             .await
@@ -761,6 +780,8 @@ impl AgentLoop {
                     tools_value.clone(),
                     tool_choice,
                     interrupt_signal.clone(),
+                    self.thinking_control,
+                    self.thinking_enabled,
                     |chunk| {
                         on_event(LoopEvent::Chunk(chunk));
                     },
@@ -935,6 +956,7 @@ impl AgentLoop {
             runtime_model_path: Some(model_path.to_path_buf()),
             llm_engine: self.llm_engine.clone(),
             bash_kill_signal: bash_signal,
+            thinking_control: self.thinking_control,
         };
 
         match self

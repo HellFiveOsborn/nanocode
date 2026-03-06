@@ -199,20 +199,22 @@ fn slash_help_text(app: &AppState) -> String {
     let mut lines = vec![
         "### Atalhos de Teclado".to_string(),
         "".to_string(),
+        "- `Ctrl+C` / `Esc`: interromper operação atual (tool call ou geração)".to_string(),
+        "- `Ctrl+D`: sair do nanocode".to_string(),
+        "- `Ctrl+T`: mostrar/ocultar tasklist".to_string(),
+        "- `Ctrl+O`: expandir/recolher saída (ferramentas, thinking, código)".to_string(),
+        "- `Shift+Tab`: alternar modo do agente (default → plan → build)".to_string(),
+        "- `Alt+T`: ligar/desligar raciocínio do modelo".to_string(),
         "- `Enter`: enviar mensagem".to_string(),
-        "- `Shift+Enter`, `Ctrl+Enter`: nova linha".to_string(),
-        "- `Esc`: interromper geração / fechar menu de slash".to_string(),
-        "- `Ctrl+C`: limpar input / sair".to_string(),
-        "- `Ctrl+T`: alternar blocos de raciocínio".to_string(),
-        "- `Ctrl+O`: alternar blocos de código/diff".to_string(),
-        "- `Ctrl+R`: alternar saída de ferramentas".to_string(),
+        "- `Shift+Enter`: nova linha".to_string(),
         "- `Ctrl+V`: colar (texto ou imagem)".to_string(),
+        "- `Tab`: autocompletar em opções".to_string(),
+        "- `Esc`: cancelar em menus".to_string(),
+        "- `↑/↓`: navegar sugestões/opções".to_string(),
+        "- `←/→`: navegar tabs de questionários".to_string(),
         "- `@arquivo` / `@pasta|busca`: anexar contexto de arquivos/pastas".to_string(),
         "- `Ctrl+L`: limpar histórico do chat".to_string(),
-        "- `Tab` / `Shift+Tab` (input vazio): alternar modo do agente (plan/build/default)"
-            .to_string(),
-        "- `?` (input vazio, Default/Build): alternar modo YOLO (aprovação automática de todas as ferramentas)"
-            .to_string(),
+        "- `?` (input vazio, Default/Build): alternar modo YOLO".to_string(),
         "- `Shift+↑/↓`, `PageUp/PageDown`: rolar histórico do chat".to_string(),
         "".to_string(),
         "### Comandos Slash".to_string(),
@@ -402,9 +404,7 @@ pub fn handle_local_command(
         }
         "/compact" => {
             app.compact_requested = true;
-            app.chat.push(ChatItem::Assistant(
-                "Compactando histórico da conversa...".to_string(),
-            ));
+            // The CompactStart event from the worker will push the ChatItem::Compact.
         }
         "/log" => {
             app.chat.push(ChatItem::Assistant(format!(
@@ -450,7 +450,7 @@ pub fn handle_local_command(
         }
         "/terminal-setup" => {
             app.chat.push(ChatItem::Assistant(
-                "Use Shift+Enter ou Ctrl+Enter para inserir uma nova linha.".to_string(),
+                "Use Shift+Enter para inserir uma nova linha.".to_string(),
             ));
         }
         cmd if is_exit_command(cmd) => return true,

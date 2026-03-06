@@ -1615,6 +1615,7 @@ dependencies = [
  "flume",
  "llama-cpp-2",
  "llama-cpp-sys-2",
+ "nanocode-hf",
  "num_cpus",
  "rayon",
  "regex",

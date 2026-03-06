@@ -383,7 +383,7 @@ fn render_tool_output_lines(
             false,
             theme,
             vec![Span::styled(
-                format!("… +{} lines (ctrl+r to expand)", remaining),
+                format!("… +{} lines (ctrl+o to expand)", remaining),
                 Style::default().fg(theme.muted),
             )],
         ));
@@ -1160,6 +1160,52 @@ fn gradient_spans(text: &str, offset: usize) -> Vec<Span<'static>> {
         .collect()
 }
 
+/// Text shimmer effect: a bright "wave" travels across the text on a base color.
+fn shimmer_spans(text: &str, frame: usize, base_color: Color) -> Vec<Span<'static>> {
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len().max(1);
+    // Bright spot position cycles through the text
+    let bright_pos = frame % (len + 4); // +4 gives a trailing gap
+    chars
+        .iter()
+        .enumerate()
+        .map(|(idx, ch)| {
+            let dist = (idx as isize - bright_pos as isize).unsigned_abs();
+            let color = if dist == 0 {
+                Color::White
+            } else if dist == 1 {
+                lerp_color(Color::White, base_color, 0.4)
+            } else if dist == 2 {
+                lerp_color(Color::White, base_color, 0.7)
+            } else {
+                base_color
+            };
+            Span::styled(
+                ch.to_string(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )
+        })
+        .collect()
+}
+
+fn lerp_color(a: Color, b: Color, t: f32) -> Color {
+    let (ar, ag, ab) = color_to_rgb(a);
+    let (br, bg, bb) = color_to_rgb(b);
+    Color::Rgb(
+        (ar as f32 + (br as f32 - ar as f32) * t) as u8,
+        (ag as f32 + (bg as f32 - ag as f32) * t) as u8,
+        (ab as f32 + (bb as f32 - ab as f32) * t) as u8,
+    )
+}
+
+fn color_to_rgb(c: Color) -> (u8, u8, u8) {
+    match c {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::White => (255, 255, 255),
+        _ => (180, 180, 180),
+    }
+}
+
 fn count_downloaded_models() -> usize {
     let models_dir = NcConfig::models_dir();
     models()
@@ -1225,9 +1271,7 @@ fn render_brand_banner(
 
 fn render_chat_lines(
     chat: &[ChatItem],
-    tools_collapsed: bool,
-    thinking_collapsed: bool,
-    code_blocks_collapsed: bool,
+    output_expanded: bool,
     spin: usize,
     model_label: &str,
     active_agent: BuiltinAgent,
@@ -1235,9 +1279,12 @@ fn render_chat_lines(
     mcp_servers_count: usize,
     theme: UiTheme,
 ) -> Vec<Line<'static>> {
+    let tools_collapsed = !output_expanded;
+    let thinking_collapsed = !output_expanded;
+    let code_blocks_collapsed = !output_expanded;
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    for item in chat {
+    for (item_idx, item) in chat.iter().enumerate() {
         match item {
             ChatItem::Banner => lines.extend(render_brand_banner(
                 model_label,
@@ -1276,21 +1323,33 @@ fn render_chat_lines(
                         ]));
                     }
                 }
-                lines.push(Line::raw(""));
+                // Skip blank line if next item is AttachmentStatus (keep it tight)
+                let next_is_attachment = chat
+                    .get(item_idx + 1)
+                    .map_or(false, |next| matches!(next, ChatItem::AttachmentStatus(_)));
+                if !next_is_attachment {
+                    lines.push(Line::raw(""));
+                }
             }
             ChatItem::Thinking { text, active } => {
-                let icon = spinner_char(spin).to_string();
-                let title = if *active {
-                    format!("{} Raciocinando...", icon)
+                if *active {
+                    let icon = spinner_char(spin).to_string();
+                    let mut title_spans = vec![Span::styled(
+                        format!("{} ", icon),
+                        Style::default()
+                            .fg(theme.info_blue)
+                            .add_modifier(Modifier::BOLD),
+                    )];
+                    title_spans.extend(shimmer_spans("Raciocínio", spin, theme.info_blue));
+                    lines.push(Line::from(title_spans));
                 } else {
-                    "⁕ Raciocínio".to_string()
-                };
-                lines.push(Line::from(vec![Span::styled(
-                    title,
-                    Style::default()
-                        .fg(theme.info_blue)
-                        .add_modifier(Modifier::BOLD),
-                )]));
+                    lines.push(Line::from(vec![Span::styled(
+                        "⁕ Raciocínio",
+                        Style::default()
+                            .fg(theme.info_blue)
+                            .add_modifier(Modifier::BOLD),
+                    )]));
+                }
 
                 let (visible_lines, truncated) =
                     thinking_teleprompter_lines(text, thinking_collapsed);
@@ -1303,9 +1362,9 @@ fn render_chat_lines(
 
                 if thinking_collapsed {
                     let hint = if truncated {
-                        "▸ modo teleprompter (Ctrl+T para mostrar todo o raciocínio)"
+                        "▸ modo teleprompter (Ctrl+O para expandir)"
                     } else {
-                        "▸ Ctrl+T para mostrar todo o raciocínio"
+                        "▸ Ctrl+O para expandir"
                     };
                     lines.push(rail_line(
                         theme.muted,
@@ -1315,7 +1374,7 @@ fn render_chat_lines(
                     lines.push(rail_line(
                         theme.muted,
                         vec![Span::styled(
-                            "▾ raciocínio completo visível (Ctrl+T para ocultar)",
+                            "▾ raciocínio completo visível (Ctrl+O para recolher)",
                             Style::default().fg(theme.muted),
                         )],
                     ));
@@ -1507,20 +1566,13 @@ fn render_chat_lines(
                         Span::styled(tool_suffix.to_string(), Style::default().fg(theme.fg)),
                     ]));
 
-                    // Running state: show elapsed time + ctrl+b hint for bash
+                    // Running state: show elapsed time
                     if is_running {
                         let elapsed_secs = started_at
                             .map(|t| t.elapsed().as_secs())
                             .unwrap_or(0);
                         let elapsed_str = format_elapsed_clock(elapsed_secs);
-                        let hint = if tool_name == "bash" {
-                            format!(
-                                "Executando… ({})\n     ctrl+b para visualizar processos",
-                                elapsed_str
-                            )
-                        } else {
-                            format!("Executando… ({})", elapsed_str)
-                        };
+                        let hint = format!("Executando… ({})", elapsed_str);
                         for hint_line in hint.lines() {
                             lines.push(tool_detail_line(
                                 true,
@@ -1593,6 +1645,61 @@ fn render_chat_lines(
 
                     lines.push(Line::raw(""));
                 }
+            }
+            ChatItem::AttachmentStatus(text) => {
+                lines.push(Line::from(vec![
+                    Span::styled("  ⎿ ", Style::default().fg(theme.muted)),
+                    Span::styled(text.clone(), Style::default().fg(theme.muted)),
+                ]));
+                // No trailing blank line — next AttachmentStatus or Thinking follows tightly.
+                // Add blank line only if next item is NOT another AttachmentStatus.
+                let next_is_attachment = chat
+                    .get(item_idx + 1)
+                    .map_or(false, |next| matches!(next, ChatItem::AttachmentStatus(_)));
+                if !next_is_attachment {
+                    lines.push(Line::raw(""));
+                }
+            }
+            ChatItem::Compact {
+                active,
+                old_tokens,
+                new_tokens,
+            } => {
+                if *active {
+                    // Shimmer on icon + text while compacting
+                    let blink = (spin / 2) % 2 == 0;
+                    let icon_style = if blink {
+                        Style::default()
+                            .fg(theme.info_blue)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme.muted).add_modifier(Modifier::BOLD)
+                    };
+                    let mut spans = vec![Span::styled("✻ ", icon_style)];
+                    spans.extend(shimmer_spans(
+                        "Compactando conversa",
+                        spin,
+                        theme.info_blue,
+                    ));
+                    spans.push(Span::styled("...", Style::default().fg(theme.muted)));
+                    lines.push(Line::from(spans));
+                } else if let Some(new_tk) = new_tokens {
+                    // Completed compact
+                    lines.push(Line::from(vec![Span::styled(
+                        "✻ Conversa compactada (ctrl+o para ver resumo)",
+                        Style::default()
+                            .fg(theme.info_blue)
+                            .add_modifier(Modifier::BOLD),
+                    )]));
+                    lines.push(Line::from(vec![
+                        Span::styled("  ⎿ ", Style::default().fg(theme.muted)),
+                        Span::styled(
+                            format!("{} → {} Tokens compactados", old_tokens, new_tk),
+                            Style::default().fg(theme.muted),
+                        ),
+                    ]));
+                }
+                lines.push(Line::raw(""));
             }
             ChatItem::Error(text) => {
                 lines.push(Line::from(vec![
@@ -2457,9 +2564,7 @@ fn render_chat_screen(frame: &mut ratatui::Frame<'_>, app: &AppState, size: Rect
 
     let mut chat_lines = render_chat_lines(
         &app.chat,
-        app.tools_collapsed,
-        app.thinking_collapsed,
-        app.code_blocks_collapsed,
+        app.output_expanded,
         app.spinner_idx,
         &app.model_label,
         app.active_agent,
@@ -3068,7 +3173,7 @@ fn render_chat_screen(frame: &mut ratatui::Frame<'_>, app: &AppState, size: Rect
         }
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![Span::styled(
-            "K encerrar processo  ·  Esc/Ctrl+B fechar",
+            "K encerrar processo  ·  Esc fechar",
             Style::default().fg(theme.muted),
         )]));
         let process_widget = Paragraph::new(lines)
@@ -3090,12 +3195,20 @@ fn render_chat_screen(frame: &mut ratatui::Frame<'_>, app: &AppState, size: Rect
         .clamp(0.0, 999.0)
         .round() as u32;
     let token_text = format!("{}% de {}k tokens", pct, max_ctx / 1000);
-    let thinking_label = if app.thinking_collapsed {
-        "Raciocínio desligado"
-    } else {
+    let thinking_model_label = if app.thinking_enabled {
         "Raciocínio ligado"
+    } else {
+        "Raciocínio desligado"
     };
-    let thinking_hint = format!("({}) (Pressione CTRL + T)", thinking_label);
+    let output_view_label = if app.output_expanded {
+        "expandido"
+    } else {
+        "recolhido"
+    };
+    let thinking_hint = format!(
+        "({}, {}) (Alt+T / Ctrl+O)",
+        thinking_model_label, output_view_label
+    );
     let right_width = token_text
         .chars()
         .count()
@@ -3108,10 +3221,15 @@ fn render_chat_screen(frame: &mut ratatui::Frame<'_>, app: &AppState, size: Rect
     let left = Paragraph::new(short_preview(&cwd, 90))
         .style(Style::default().bg(theme.bg).fg(theme.muted));
     frame.render_widget(left, footer_cols[0]);
-    let thinking_color = if app.thinking_collapsed {
-        theme.warning
-    } else {
+    let thinking_model_color = if app.thinking_enabled {
         theme.success
+    } else {
+        theme.warning
+    };
+    let thinking_view_color = if app.output_expanded {
+        theme.success
+    } else {
+        theme.warning
     };
     let right = Paragraph::new(vec![
         Line::from(vec![Span::styled(
@@ -3121,13 +3239,20 @@ fn render_chat_screen(frame: &mut ratatui::Frame<'_>, app: &AppState, size: Rect
         Line::from(vec![
             Span::styled("(", Style::default().fg(theme.muted)),
             Span::styled(
-                thinking_label,
+                thinking_model_label,
                 Style::default()
-                    .fg(thinking_color)
+                    .fg(thinking_model_color)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(")", Style::default().fg(theme.muted)),
-            Span::styled(" (Pressione CTRL + T)", Style::default().fg(theme.accent)),
+            Span::styled(", ", Style::default().fg(theme.muted)),
+            Span::styled(
+                output_view_label,
+                Style::default()
+                    .fg(thinking_view_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(") ", Style::default().fg(theme.muted)),
+            Span::styled("(Alt+T / Ctrl+O)", Style::default().fg(theme.accent)),
         ]),
     ])
     .alignment(Alignment::Right)

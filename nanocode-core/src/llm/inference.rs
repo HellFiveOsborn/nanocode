@@ -3,6 +3,7 @@
 use crate::config::NcConfig;
 use crate::interrupt::user_interrupted_error;
 use crate::types::LlmMessage;
+use nanocode_hf::ThinkingControl;
 use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
@@ -13,13 +14,59 @@ use llama_cpp_2::sampling::LlamaSampler;
 use serde_json::{json, Value};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// Resolved thinking parameters ready for `build_prompt`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ThinkingParams {
+    enable_thinking: bool,
+    chat_template_kwargs: Option<&'static str>,
+}
+
+impl ThinkingParams {
+    /// Resolve from a model's `ThinkingControl` and the runtime toggle.
+    pub fn resolve(control: ThinkingControl, enabled: bool) -> Self {
+        match control {
+            ThinkingControl::None => Self {
+                enable_thinking: false,
+                chat_template_kwargs: None,
+            },
+            ThinkingControl::Qwen3 => Self {
+                enable_thinking: enabled,
+                chat_template_kwargs: Some(if enabled {
+                    "{\"enable_thinking\":true}"
+                } else {
+                    "{\"enable_thinking\":false}"
+                }),
+            },
+        }
+    }
+}
+
+/// Global backend singleton — `LlamaBackend::init()` must only be called once.
+static LLAMA_BACKEND: Mutex<Option<LlamaBackend>> = Mutex::new(None);
+
+fn get_or_init_backend() -> Result<&'static LlamaBackend, String> {
+    let mut guard = LLAMA_BACKEND
+        .lock()
+        .map_err(|e| format!("backend lock poisoned: {e}"))?;
+    if guard.is_none() {
+        let mut b =
+            LlamaBackend::init().map_err(|e| format!("llama backend init failed: {e}"))?;
+        b.void_logs();
+        *guard = Some(b);
+    }
+    // SAFETY: once set, the Option is never changed back to None, and the
+    // static lives for the entire process.
+    let ptr = guard.as_ref().unwrap() as *const LlamaBackend;
+    Ok(unsafe { &*ptr })
+}
 
 /// Persistent LLM model loaded in memory.
 ///
 /// Holds the llama.cpp backend and model across calls so the expensive
 /// model-load happens only once. A new context is created per generate call.
 pub struct LoadedModel {
-    backend: LlamaBackend,
     model: LlamaModel,
     config: NcConfig,
     model_path: PathBuf,
@@ -28,9 +75,7 @@ pub struct LoadedModel {
 impl LoadedModel {
     /// Load the model from disk. This is the expensive one-time operation.
     pub fn load(model_path: &Path, config: &NcConfig) -> Result<Self, String> {
-        let mut backend =
-            LlamaBackend::init().map_err(|e| format!("llama backend init failed: {e}"))?;
-        backend.void_logs();
+        let backend = get_or_init_backend()?;
 
         let auto_gpu_layers = config.model.n_gpu_layers < 0;
         let wants_gpu_layers = if auto_gpu_layers {
@@ -60,7 +105,6 @@ impl LoadedModel {
                 })?;
 
         Ok(Self {
-            backend,
             model,
             config: config.clone(),
             model_path: model_path.to_path_buf(),
@@ -80,16 +124,24 @@ impl LoadedModel {
         tools: Option<serde_json::Value>,
         tool_choice: Option<serde_json::Value>,
     ) -> Result<String, String> {
-        self.generate_with_chunk_callback(messages, max_tokens, tools, tool_choice, None)
+        self.generate_with_chunk_callback(
+            messages,
+            max_tokens,
+            tools,
+            tool_choice,
+            None,
+            ThinkingParams::resolve(ThinkingControl::Qwen3, true),
+        )
     }
 
-    pub fn generate_with_chunk_callback(
+    pub(crate) fn generate_with_chunk_callback(
         &self,
         messages: &[LlmMessage],
         max_tokens: u32,
         tools: Option<serde_json::Value>,
         tool_choice: Option<serde_json::Value>,
         mut on_chunk: Option<&mut dyn FnMut(&str) -> bool>,
+        thinking: ThinkingParams,
     ) -> Result<String, String> {
         let ctx_size = self
             .config
@@ -115,6 +167,7 @@ impl LoadedModel {
             tools_json_owned.as_deref(),
             tool_choice_json,
             None,
+            thinking,
         )?;
         let prompt = &template_result.prompt;
         let tokens = self
@@ -193,7 +246,8 @@ impl LoadedModel {
                 );
             }
 
-            match self.model.new_context(&self.backend, ctx_params) {
+            let backend = get_or_init_backend().map_err(|e| e.to_string())?;
+            match self.model.new_context(backend, ctx_params) {
                 Ok(created_ctx) => {
                     used_fallback = idx > 0;
                     used_candidate = candidate;
@@ -271,6 +325,15 @@ impl LoadedModel {
             LlamaSampler::dist(42),
         ]);
 
+        // Stop strings: some quantized models emit these as regular text tokens
+        // instead of special EOS tokens, so we must detect them in the output.
+        const STOP_STRINGS: &[&str] = &[
+            "<|im_end|>",
+            "<|endoftext|>",
+            "<|im_start|>user",
+            "<|im_start|>system",
+        ];
+
         let mut result = String::new();
         let mut pos = tokens.len() as i32;
         let mut decoder = encoding_rs::UTF_8.new_decoder();
@@ -293,6 +356,27 @@ impl LoadedModel {
                 .token_to_piece(token, &mut decoder, true, None)
                 .map_err(|e| format!("failed to decode token piece: {e}"))?;
             result.push_str(&piece);
+
+            // Check for stop strings only in the tail of the result (efficient).
+            // The longest stop string is ~20 chars; check a window slightly larger.
+            let mut tail_start = result.len().saturating_sub(32);
+            // Align to a char boundary to avoid slicing mid-character.
+            while tail_start > 0 && !result.is_char_boundary(tail_start) {
+                tail_start -= 1;
+            }
+            let tail = &result[tail_start..];
+            let mut hit_stop = false;
+            for stop in STOP_STRINGS {
+                if let Some(rel_idx) = tail.find(stop) {
+                    result.truncate(tail_start + rel_idx);
+                    hit_stop = true;
+                    break;
+                }
+            }
+            if hit_stop {
+                break;
+            }
+
             if let Some(callback) = on_chunk.as_deref_mut() {
                 if !callback(&piece) {
                     return Err(user_interrupted_error());
@@ -342,6 +426,7 @@ impl LoadedModel {
         tools_json: Option<&str>,
         tool_choice_json: Option<&str>,
         tool_grammar: Option<&str>,
+        thinking: ThinkingParams,
     ) -> Result<ChatTemplateResult, String> {
         let template = self
             .model
@@ -392,11 +477,11 @@ impl LoadedModel {
             json_schema: None,
             grammar: tool_grammar,
             reasoning_format: None,
-            chat_template_kwargs: Some("{\"enable_thinking\":true}"),
+            chat_template_kwargs: thinking.chat_template_kwargs,
             add_generation_prompt: true,
             use_jinja: true,
             parallel_tool_calls: false,
-            enable_thinking: true,
+            enable_thinking: thinking.enable_thinking,
             add_bos: false,
             add_eos: false,
             parse_tool_calls: true,
@@ -447,7 +532,14 @@ impl LlmEngine {
         on_chunk: Option<&mut dyn FnMut(&str) -> bool>,
     ) -> Result<String, String> {
         let loaded = LoadedModel::load(&self.model_path, &self.config)?;
-        loaded.generate_with_chunk_callback(messages, max_tokens, tools, tool_choice, on_chunk)
+        loaded.generate_with_chunk_callback(
+            messages,
+            max_tokens,
+            tools,
+            tool_choice,
+            on_chunk,
+            ThinkingParams::resolve(ThinkingControl::Qwen3, true),
+        )
     }
 }
 
@@ -490,6 +582,8 @@ impl LlmEngineHandle {
         tools: Option<serde_json::Value>,
         tool_choice: Option<serde_json::Value>,
         on_chunk: &mut dyn FnMut(&str) -> bool,
+        thinking_control: ThinkingControl,
+        thinking_enabled: bool,
     ) -> Result<String, String> {
         let loaded = self.loaded.lock().map_err(|e| e.to_string())?;
         loaded.generate_with_chunk_callback(
@@ -498,6 +592,7 @@ impl LlmEngineHandle {
             tools,
             tool_choice,
             Some(on_chunk),
+            ThinkingParams::resolve(thinking_control, thinking_enabled),
         )
     }
 }

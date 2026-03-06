@@ -11,6 +11,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 use super::inference::{LlmEngine, LlmEngineHandle};
+use nanocode_hf::ThinkingControl;
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -162,6 +163,8 @@ pub async fn chat_via_engine_streaming<F>(
     tools: Option<serde_json::Value>,
     tool_choice: Option<serde_json::Value>,
     interrupt_signal: Option<Arc<AtomicBool>>,
+    thinking_control: ThinkingControl,
+    thinking_enabled: bool,
     mut on_chunk: F,
 ) -> Result<String, String>
 where
@@ -186,21 +189,36 @@ where
             tools_owned,
             tool_choice_owned,
             &mut callback,
+            thinking_control,
+            thinking_enabled,
         )
     });
 
-    loop {
+    let result = loop {
         tokio::select! {
+            // Bias towards draining chunks first before checking task completion.
+            biased;
             maybe_chunk = chunk_rx.recv() => {
-                if let Some(chunk) = maybe_chunk {
-                    on_chunk(chunk);
+                match maybe_chunk {
+                    Some(chunk) => on_chunk(chunk),
+                    None => {
+                        // Channel closed (sender dropped) — task must be finishing.
+                        break generate_task
+                            .await
+                            .map_err(|e| format!("inference task join failed: {e}"))?;
+                    }
                 }
             }
             task_result = &mut generate_task => {
-                return task_result.map_err(|e| format!("inference task join failed: {e}"))?;
+                break task_result.map_err(|e| format!("inference task join failed: {e}"))?;
             }
         }
+    };
+    // Drain any remaining chunks that arrived before the task completed.
+    while let Ok(chunk) = chunk_rx.try_recv() {
+        on_chunk(chunk);
     }
+    result
 }
 
 /// Run inference loading a fresh model per call (legacy — prefer `chat_via_engine_streaming`).
@@ -240,21 +258,33 @@ where
             tools_owned,
             tool_choice_owned,
             &mut callback,
+            ThinkingControl::Qwen3,
+            true,
         )
     });
 
-    loop {
+    let result = loop {
         tokio::select! {
+            biased;
             maybe_chunk = chunk_rx.recv() => {
-                if let Some(chunk) = maybe_chunk {
-                    on_chunk(chunk);
+                match maybe_chunk {
+                    Some(chunk) => on_chunk(chunk),
+                    None => {
+                        break generate_task
+                            .await
+                            .map_err(|e| format!("inference task join failed: {e}"))?;
+                    }
                 }
             }
             task_result = &mut generate_task => {
-                return task_result.map_err(|e| format!("inference task join failed: {e}"))?;
+                break task_result.map_err(|e| format!("inference task join failed: {e}"))?;
             }
         }
+    };
+    while let Ok(chunk) = chunk_rx.try_recv() {
+        on_chunk(chunk);
     }
+    result
 }
 
 async fn chat_completions(

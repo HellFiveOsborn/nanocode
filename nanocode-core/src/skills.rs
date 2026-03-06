@@ -6,7 +6,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::config::NcConfig;
 
@@ -86,13 +86,6 @@ impl SkillManager {
         let search_paths = compute_search_paths(config);
         let discovered = discover_skills(&search_paths);
 
-        if !discovered.is_empty() {
-            info!(
-                "discovered {} skill(s) from {} search path(s)",
-                discovered.len(),
-                search_paths.len()
-            );
-        }
 
         Self {
             search_paths,

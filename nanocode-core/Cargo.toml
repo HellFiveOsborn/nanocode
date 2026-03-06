@@ -21,6 +21,9 @@ chrono.workspace = true
 uuid.workspace = true
 dirs.workspace = true
 
+# Sibling crates
+nanocode-hf = { path = "../nanocode-hf" }
+
 # Async trait
 async-trait = "0.1"
 

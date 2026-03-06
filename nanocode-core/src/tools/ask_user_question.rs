@@ -254,6 +254,7 @@ mod tests {
             runtime_model_path: None,
             llm_engine: None,
             bash_kill_signal: None,
+            thinking_control: nanocode_hf::ThinkingControl::None,
         };
 
         let output = tool
@@ -294,6 +295,7 @@ mod tests {
             runtime_model_path: None,
             llm_engine: None,
             bash_kill_signal: None,
+            thinking_control: nanocode_hf::ThinkingControl::None,
         };
 
         let output = tool

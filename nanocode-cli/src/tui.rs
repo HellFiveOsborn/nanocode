@@ -163,7 +163,8 @@ fn apply_worker_event(
             app.model_label = model_label;
             app.supports_thinking = supports_thinking;
             app.supports_vision = supports_vision;
-            app.thinking_collapsed = !supports_thinking;
+            app.thinking_enabled = supports_thinking;
+            // output_expanded stays as-is; thinking is controlled by output_expanded
             app.busy = false;
             app.busy_started_at = None;
             app.status = format!("pronto · agente {}", agent_status_label(app.active_agent));
@@ -191,6 +192,15 @@ fn apply_worker_event(
             }
         }
         WorkerEvent::Interrupted => {
+            app.busy = false;
+            app.busy_started_at = None;
+            if let Some(idx) = app.thinking_idx {
+                if let Some(ChatItem::Thinking { active, .. }) = app.chat.get_mut(idx) {
+                    *active = false;
+                }
+            }
+            app.thinking_idx = None;
+            app.stream_idx = None;
             app.status = "interrompido".to_string();
         }
         WorkerEvent::ThinkingActive(active) => {
@@ -269,6 +279,19 @@ fn apply_worker_event(
             } else if has_text {
                 app.chat.push(ChatItem::Assistant(final_text.clone()));
             }
+
+            // Clear busy eagerly so spinner stops as soon as the response is complete.
+            // The subsequent Busy(false) from the worker will be a harmless no-op.
+            app.busy = false;
+            app.busy_started_at = None;
+            if let Some(idx) = app.thinking_idx {
+                if let Some(ChatItem::Thinking { active, .. }) = app.chat.get_mut(idx) {
+                    *active = false;
+                }
+            }
+            app.thinking_idx = None;
+            app.stream_idx = None;
+            app.status = format!("pronto · agente {}", agent_status_label(app.active_agent));
 
             if should_offer_review {
                 app.pending_plan_review = Some(PendingPlanReview {
@@ -430,23 +453,28 @@ fn apply_worker_event(
         }
         WorkerEvent::CompactStart {
             old_context_tokens,
-            threshold,
         } => {
             app.status = "compactando contexto automaticamente".to_string();
-            app.chat.push(ChatItem::Assistant(format!(
-                "[compact] Disparado com {} tokens (limite {}).",
-                old_context_tokens, threshold
-            )));
+            app.chat.push(ChatItem::Compact {
+                active: true,
+                old_tokens: old_context_tokens,
+                new_tokens: None,
+            });
         }
         WorkerEvent::CompactEnd {
             old_context_tokens,
             new_context_tokens,
-            summary_len,
         } => {
-            app.chat.push(ChatItem::Assistant(format!(
-                "[compact] Concluído: {} -> {} tokens (resumo com {} caracteres).",
-                old_context_tokens, new_context_tokens, summary_len
-            )));
+            // Replace the active Compact item with the completed one
+            if let Some(item) = app.chat.iter_mut().rev().find(|i| {
+                matches!(i, ChatItem::Compact { active: true, .. })
+            }) {
+                *item = ChatItem::Compact {
+                    active: false,
+                    old_tokens: old_context_tokens,
+                    new_tokens: Some(new_context_tokens),
+                };
+            }
             app.status = format!("pronto · agente {}", agent_status_label(app.active_agent));
         }
         WorkerEvent::StoppedByMiddleware { reason } => {
@@ -761,7 +789,7 @@ async fn submit_prompt(
     app.input_mode = InputMode::Default;
     app.input.clear();
     clear_pending_pastes(app);
-    app.thinking_collapsed = !app.supports_thinking;
+    // output_expanded preserved across turns
     clear_mention_suggestions(app);
     refresh_input_suggestions(app, attachment_engine);
 
@@ -801,7 +829,9 @@ async fn submit_prompt(
 
     let expansion = attachment_engine.expand_prompt(prompt_for_model);
     for line in expansion.status_lines {
-        app.chat.push(ChatItem::Assistant(line));
+        // Strip leading "⎿ " prefix — AttachmentStatus renders its own prefix.
+        let cleaned = line.strip_prefix("⎿ ").unwrap_or(&line);
+        app.chat.push(ChatItem::AttachmentStatus(cleaned.to_string()));
     }
     for err in expansion.errors {
         app.chat.push(ChatItem::Error(err));
@@ -1184,13 +1214,15 @@ async fn handle_key_event(
 
     match (key.code, key.modifiers) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-            if app.input.is_empty() {
-                return true;
+            if app.busy {
+                set_interrupt_signal(interrupt_signal);
+                app.status = "interrompendo".to_string();
+            } else if !app.input.is_empty() {
+                app.input.clear();
+                clear_pending_pastes(app);
+                app.input_mode = InputMode::Default;
+                refresh_input_suggestions(app, attachment_engine);
             }
-            app.input.clear();
-            clear_pending_pastes(app);
-            app.input_mode = InputMode::Default;
-            refresh_input_suggestions(app, attachment_engine);
         }
         (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
             return true;
@@ -1203,35 +1235,42 @@ async fn handle_key_event(
             };
         }
         _ if app.screen == UiScreen::Welcome => {}
-        (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
-            app.tools_collapsed = !app.tools_collapsed;
-            app.status = if app.tools_collapsed {
-                "saída de ferramenta oculta (Ctrl+R para mostrar)".to_string()
-            } else {
-                "saída de ferramenta visível (Ctrl+R para ocultar)".to_string()
-            };
-        }
         (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
-            app.code_blocks_collapsed = !app.code_blocks_collapsed;
-            app.status = if app.code_blocks_collapsed {
-                "código/diff oculto (Ctrl+O para mostrar)".to_string()
+            app.output_expanded = !app.output_expanded;
+            app.status = if app.output_expanded {
+                "saída expandida (Ctrl+O para recolher)".to_string()
             } else {
-                "código/diff visível (Ctrl+O para ocultar)".to_string()
+                "saída recolhida (Ctrl+O para expandir)".to_string()
             };
         }
         (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
-            app.thinking_collapsed = !app.thinking_collapsed;
-            app.status = if app.thinking_collapsed {
-                "raciocínio oculto (Ctrl+T para mostrar)".to_string()
+            app.tasklist_open = !app.tasklist_open;
+            app.status = if app.tasklist_open {
+                "tasklist aberta (Ctrl+T para fechar)".to_string()
             } else {
-                "raciocínio visível (Ctrl+T para ocultar)".to_string()
+                format!("pronto · agente {}", agent_status_label(app.active_agent))
             };
+        }
+        (KeyCode::Char('t'), KeyModifiers::ALT) => {
+            if !app.supports_thinking {
+                app.status = "modelo atual não suporta raciocínio".to_string();
+            } else {
+                app.thinking_enabled = !app.thinking_enabled;
+                if let Some(cmd_tx) = cmd_tx {
+                    let _ = cmd_tx.send(WorkerCommand::SetThinkingEnabled(app.thinking_enabled)).await;
+                }
+                app.status = if app.thinking_enabled {
+                    "raciocínio do modelo ligado".to_string()
+                } else {
+                    "raciocínio do modelo desligado".to_string()
+                };
+            }
         }
         (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
             if !app.running_bash_call_ids.is_empty() {
                 app.process_viewer_open = !app.process_viewer_open;
                 app.status = if app.process_viewer_open {
-                    "Processos ativos (K para encerrar, Ctrl+B para fechar)".to_string()
+                    "Processos ativos (K para encerrar, Esc para fechar)".to_string()
                 } else {
                     format!("pronto · agente {}", agent_status_label(app.active_agent))
                 };
@@ -1296,6 +1335,10 @@ async fn handle_key_event(
             bash_kill_signal.store(true, std::sync::atomic::Ordering::Relaxed);
             app.status = "Encerrando processo bash...".to_string();
         }
+        (KeyCode::Esc, _) if app.tasklist_open => {
+            app.tasklist_open = false;
+            app.status = format!("pronto · agente {}", agent_status_label(app.active_agent));
+        }
         (KeyCode::Esc, _) if app.busy => {
             set_interrupt_signal(interrupt_signal);
             app.status = "interrompendo".to_string();
@@ -1325,12 +1368,7 @@ async fn handle_key_event(
             }
         }
         (KeyCode::BackTab, KeyModifiers::SHIFT | KeyModifiers::NONE)
-            if !app.busy && app.input_mode == InputMode::Default && app.input.is_empty() =>
-        {
-            queue_agent_cycle(app, true);
-        }
-        (KeyCode::Tab, KeyModifiers::NONE)
-            if !app.busy && app.input_mode == InputMode::Default && app.input.is_empty() =>
+            if !app.busy && app.input_mode == InputMode::Default =>
         {
             queue_agent_cycle(app, false);
         }
@@ -1346,7 +1384,7 @@ async fn handle_key_event(
                 let _ = tx.send(WorkerCommand::SetAutoApprove(app.yolo_mode)).await;
             }
         }
-        (KeyCode::Enter, KeyModifiers::CONTROL | KeyModifiers::ALT) if !app.busy => {
+        (KeyCode::Enter, KeyModifiers::SHIFT) if !app.busy => {
             app.input.push('\n');
         }
         (KeyCode::Enter, _) if !app.busy => {
@@ -2159,9 +2197,9 @@ async fn restart_chat_worker(
     *bash_kill_signal_out = bash_kill;
     app.max_context_tokens = max_context_tokens;
     app.running_bash_call_ids.clear();
-    app.status = "inicializando modelo...".to_string();
-    app.busy = true;
-    app.busy_started_at = Some(Instant::now());
+    app.status = format!("pronto · agente {}", agent_status_label(app.active_agent));
+    app.busy = false;
+    app.busy_started_at = None;
     Ok(())
 }
 
@@ -2274,9 +2312,29 @@ pub async fn run_tui(
         }
 
         if let Some(evt_rx) = worker_evt_rx.as_ref() {
-            while let Ok(evt) = evt_rx.try_recv() {
-                apply_worker_event(&mut app, evt, &mut tool_index_by_id, &mut rewind_manager);
-                needs_redraw = true;
+            loop {
+                match evt_rx.try_recv() {
+                    Ok(evt) => {
+                        apply_worker_event(
+                            &mut app,
+                            evt,
+                            &mut tool_index_by_id,
+                            &mut rewind_manager,
+                        );
+                        needs_redraw = true;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // Worker died — force busy off so UI doesn't hang.
+                        if app.busy {
+                            app.busy = false;
+                            app.busy_started_at = None;
+                            app.status = "worker encerrado inesperadamente".to_string();
+                            needs_redraw = true;
+                        }
+                        break;
+                    }
+                }
             }
         }
 

@@ -55,6 +55,14 @@ pub enum ChatItem {
         started_at: Option<Instant>,
     },
     Error(String),
+    /// Attachment status line (e.g. "Leu index.css (1 linhas)") — no trailing blank line.
+    AttachmentStatus(String),
+    /// Compact progress/result display.
+    Compact {
+        active: bool,
+        old_tokens: u32,
+        new_tokens: Option<u32>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -331,9 +339,9 @@ pub struct AppState {
     pub telemetry: RuntimeTelemetry,
     pub max_context_tokens: u32,
     pub busy: bool,
-    pub tools_collapsed: bool,
-    pub thinking_collapsed: bool,
-    pub code_blocks_collapsed: bool,
+    pub output_expanded: bool,
+    pub thinking_enabled: bool,
+    pub tasklist_open: bool,
     pub chat_scroll: u16,
     pub spinner_idx: usize,
     pub stream_idx: Option<usize>,
@@ -391,9 +399,9 @@ impl AppState {
             telemetry,
             max_context_tokens,
             busy: true,
-            tools_collapsed: false,
-            thinking_collapsed: true,
-            code_blocks_collapsed: false,
+            output_expanded: false,
+            thinking_enabled: false,
+            tasklist_open: false,
             chat_scroll: 0,
             spinner_idx: 0,
             stream_idx: None,

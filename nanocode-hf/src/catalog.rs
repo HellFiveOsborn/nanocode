@@ -17,6 +17,17 @@ impl ModelCategory {
     }
 }
 
+/// How the model's chat template controls thinking on/off.
+/// Each model family may use a different mechanism; this enum keeps
+/// inference code model-agnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingControl {
+    /// Model does not support togglable thinking.
+    None,
+    /// Qwen3-style: `enable_thinking` param + `chat_template_kwargs: {"enable_thinking": bool}`.
+    Qwen3,
+}
+
 /// Model specification used by setup/runtime selection.
 #[derive(Debug, Clone, Copy)]
 pub struct ModelSpec {
@@ -25,6 +36,7 @@ pub struct ModelSpec {
     pub hf_repo: &'static str,
     pub category: ModelCategory,
     pub supports_thinking: bool,
+    pub thinking_control: ThinkingControl,
     pub supports_vision: bool,
     /// Maximum context supported by the model architecture
     pub max_context_size: u32,
@@ -187,6 +199,7 @@ pub const QWEN3_4B_THINKING: ModelSpec = ModelSpec {
     hf_repo: "unsloth/Qwen3-4B-Thinking-2507-GGUF",
     category: ModelCategory::Thinking,
     supports_thinking: true,
+    thinking_control: ThinkingControl::Qwen3,
     supports_vision: false,
     max_context_size: 262_144,
     recommended_context_general: 32_768,
@@ -201,6 +214,7 @@ pub const QWEN3_5_4B: ModelSpec = ModelSpec {
     hf_repo: "unsloth/Qwen3.5-4B-GGUF",
     category: ModelCategory::Instruct,
     supports_thinking: true,
+    thinking_control: ThinkingControl::Qwen3,
     supports_vision: true,
     max_context_size: 131_072,
     recommended_context_general: 32_768,

@@ -362,6 +362,8 @@ pub struct InvokeContext {
     pub llm_engine: Option<Arc<crate::llm::LlmEngineHandle>>,
     /// Kill signal for the bash tool — when set to true, the running process is terminated.
     pub bash_kill_signal: Option<crate::tools::bash::BashKillSignal>,
+    /// How the model controls thinking (inherited from parent for subagents).
+    pub thinking_control: nanocode_hf::ThinkingControl,
 }
 
 /// Approval request for a tool
